@@ -23,6 +23,7 @@ from app.modules.connectors.schemas import (
     OperationView,
     ScheduleUpsert,
     ScheduleView,
+    SchemaSnapshotView,
     SyncRunView,
     WorkspaceCreate,
     WorkspaceView,
@@ -162,6 +163,22 @@ async def _queue_connection_operation(
         return OperationAccepted(operation_id=operation.operation_id, status=operation.status)
     except Exception as exc:
         raise _translate_error(exc) from exc
+
+
+@router.get(
+    "/workspaces/{workspace_id}/datasets/{dataset_id}/schema-snapshots",
+    response_model=list[SchemaSnapshotView],
+)
+async def get_dataset_schema_snapshots(
+    workspace_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    session: SessionDep,
+) -> Sequence[SchemaSnapshotView]:
+    repository = ConnectorRepository(session)
+    if await repository.get_dataset(workspace_id, dataset_id) is None:
+        raise HTTPException(status_code=404, detail="dataset not found")
+    rows = await repository.list_schema_snapshots(workspace_id, dataset_id)
+    return [SchemaSnapshotView.model_validate(row) for row in rows]
 
 
 @router.post(

@@ -158,6 +158,18 @@ class DatasetView(ViewModel):
     updated_at: datetime
 
 
+class SchemaSnapshotView(ViewModel):
+    schema_snapshot_id: uuid.UUID
+    workspace_id: uuid.UUID
+    dataset_id: uuid.UUID
+    schema_hash: str
+    schema_definition: dict[str, Any] = Field(
+        validation_alias="schema_json", serialization_alias="schema_json"
+    )
+    compatibility_status: str
+    discovered_at: datetime
+
+
 class FieldMapping(BaseModel):
     source_path: str = Field(min_length=1, max_length=500)
     target_field: str = Field(min_length=1, max_length=100)

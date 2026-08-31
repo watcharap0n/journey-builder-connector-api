@@ -13,6 +13,7 @@ from app.modules.connectors.model import (
     ConnectorOperation,
     ConnectorSchedule,
     MappingVersion,
+    SchemaSnapshot,
     SyncRun,
     Workspace,
 )
@@ -71,6 +72,19 @@ class ConnectorRepository:
                 )
             )
         )
+
+    async def list_schema_snapshots(
+        self, workspace_id: uuid.UUID, dataset_id: uuid.UUID
+    ) -> Sequence[SchemaSnapshot]:
+        result = await self.session.scalars(
+            select(SchemaSnapshot)
+            .where(
+                SchemaSnapshot.workspace_id == workspace_id,
+                SchemaSnapshot.dataset_id == dataset_id,
+            )
+            .order_by(SchemaSnapshot.discovered_at.desc())
+        )
+        return result.all()
 
     async def get_mapping(
         self, workspace_id: uuid.UUID, mapping_id: uuid.UUID

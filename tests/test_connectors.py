@@ -106,4 +106,8 @@ def test_active_sync_index_is_partial_and_unique() -> None:
 def test_openapi_exposes_workspace_scoped_connector_routes(settings) -> None:
     paths = create_app(settings).openapi()["paths"]
     assert "/api/v1/workspaces/{workspace_id}/connectors" in paths
+    assert (
+        "/api/v1/workspaces/{workspace_id}/datasets/{dataset_id}/schema-snapshots"
+        in paths
+    )
     assert "/api/v1/workspaces/{workspace_id}/datasets/{dataset_id}/runs" in paths

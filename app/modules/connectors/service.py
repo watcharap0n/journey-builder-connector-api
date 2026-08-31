@@ -552,7 +552,9 @@ async def materialize_sync_run(
         "output_key": output_key,
         "ingestion_batch_id": ingestion_batch_id,
         "source_system_id": connection.source_system_id,
-        "sync_run_id": sync_run_id,
+        # asyncpg infers this bind as text from CAST(:sync_run_id AS text).
+        # Pass a string rather than uuid.UUID to match the inferred parameter type.
+        "sync_run_id": str(sync_run_id),
         "stitching_job_id": stitching_job_id,
     }
     await session.execute(

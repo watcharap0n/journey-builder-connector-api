@@ -1,6 +1,7 @@
 from app.main import create_app
+from app.modules.standardization import service as standardization_service
 from app.modules.standardization.schemas import SourcePartitionInventory
-from app.modules.standardization.service import INVENTORY_SQL
+from app.modules.standardization.service import INVENTORY_SQL, discover_source_inventory
 
 
 def test_openapi_exposes_manual_standardization_routes(settings) -> None:
@@ -27,3 +28,48 @@ def test_inventory_tracks_both_baseline_and_incremental_cutoffs() -> None:
     assert "max(version.ingest_id)" in INVENTORY_SQL
     assert "FROM migration.elasticsearch_indices" in INVENTORY_SQL
     assert "EXISTS" in INVENTORY_SQL
+
+
+async def test_inventory_connection_uses_configured_sslmode(
+    monkeypatch, settings
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _SecretsManagerClient:
+        def get_secret_value(self, *, SecretId: str) -> dict[str, str]:
+            assert SecretId == "source-secret"
+            return {
+                "SecretString": (
+                    '{"host":"database.internal","port":5432,'
+                    '"username":"reader","password":"secret"}'
+                )
+            }
+
+    class _Connection:
+        async def fetch(self, _query: str) -> list[object]:
+            return []
+
+        async def close(self) -> None:
+            return None
+
+    async def _connect(**kwargs):
+        captured.update(kwargs)
+        return _Connection()
+
+    monkeypatch.setattr(
+        standardization_service.boto3,
+        "client",
+        lambda *_args, **_kwargs: _SecretsManagerClient(),
+    )
+    monkeypatch.setattr(standardization_service.asyncpg, "connect", _connect)
+    configured = settings.model_copy(
+        update={
+            "standardization_source_secret_id": "source-secret",
+            "standardization_source_sslmode": "require",
+        }
+    )
+
+    inventory = await discover_source_inventory(configured)
+
+    assert inventory == []
+    assert captured["ssl"] == "require"

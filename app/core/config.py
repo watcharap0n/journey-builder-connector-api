@@ -1,6 +1,7 @@
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,13 +54,35 @@ class Settings(BaseSettings):
 
     standardization_source_secret_id: str | None = None
     standardization_source_database: str = "elasticsearch"
-    standardization_source_ssl: bool = True
+    standardization_source_sslmode: Literal[
+        "disable", "allow", "prefer", "require", "verify-ca", "verify-full"
+    ] = Field(
+        default="require",
+        validation_alias=AliasChoices(
+            "STANDARDIZATION_SOURCE_SSLMODE",
+            "STANDARDIZATION_SOURCE_SSL",
+        ),
+    )
     standardization_dispatch_queue_url: str | None = None
     standardization_result_queue_url: str | None = None
     standardization_worker_poll_seconds: int = Field(default=10, ge=1, le=300)
     standardization_stale_partition_seconds: int = Field(
         default=900, ge=120, le=86400
     )
+
+    @field_validator("standardization_source_sslmode", mode="before")
+    @classmethod
+    def normalize_standardization_source_sslmode(cls, value: object) -> object:
+        if isinstance(value, bool):
+            return "require" if value else "disable"
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return "require"
+            if normalized in {"false", "0", "no", "off"}:
+                return "disable"
+            return normalized
+        return value
 
 
 @lru_cache

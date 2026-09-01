@@ -70,7 +70,7 @@ async def discover_source_inventory(
         user=secret.get("username", secret.get("user")),
         password=secret["password"],
         database=settings.standardization_source_database,
-        ssl=settings.standardization_source_ssl,
+        ssl=settings.standardization_source_sslmode,
         timeout=30,
         server_settings={"application_name": "standardization_run_planner"},
     )

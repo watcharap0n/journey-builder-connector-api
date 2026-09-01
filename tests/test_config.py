@@ -89,3 +89,18 @@ def test_local_secret_manager_host_maps_to_forwarded_loopback(
     assert url == (
         "postgresql+asyncpg://postgres:p%40ss%3Fword@127.0.0.1:55432/postgres"
     )
+
+
+@pytest.mark.parametrize(
+    ("legacy_value", "expected"),
+    [("true", "require"), ("false", "disable")],
+)
+def test_legacy_standardization_ssl_boolean_maps_to_sslmode(
+    legacy_value: str, expected: str
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        STANDARDIZATION_SOURCE_SSL=legacy_value,
+    )
+
+    assert settings.standardization_source_sslmode == expected

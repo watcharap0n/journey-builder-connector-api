@@ -97,9 +97,14 @@ Primary routes are under `/api/v1/workspaces/{workspace_id}`:
 
 - `POST /connectors`, `PUT /connectors/{connection_id}/credentials`
 - `POST /connectors/{connection_id}/test` and `/discover`
-- `PATCH /datasets/{dataset_id}`, mapping create/publish routes
+- `PATCH /datasets/{dataset_id}`, schema snapshots, mapping create/publish routes
+- `POST /datasets/{dataset_id}/preview` for an asynchronous, bounded raw-row preview
 - schedule create/read/pause/resume and `POST /datasets/{dataset_id}/runs`
 - operation and sync-run status reads
+
+Dataset discovery records an approximate row count without running a full
+`COUNT(*)`. Preview operations default to 10 rows (maximum 50); poll the normal
+operation endpoint and consume `result_json` before its 15-minute expiry.
 
 Run background processes separately from API replicas:
 
@@ -140,11 +145,40 @@ Configure `STANDARDIZATION_SOURCE_SECRET_ID`,
 from the separate standardization runtime stack. There is no schedule or
 restore-status trigger in v1.
 
-Run the complete `api + redis` stack:
+`STANDARDIZATION_SOURCE_SSLMODE` defaults to `require`, which encrypts forwarded
+or tunneled PostgreSQL connections without CA/hostname verification. Use
+`verify-full` only with the database CA bundle installed and a hostname that
+matches the certificate. Legacy `STANDARDIZATION_SOURCE_SSL=true` is accepted
+and normalized to `require`.
+
+Run the complete API, Redis, and control-plane worker stack:
 
 ```bash
-docker compose up --build
+docker compose build api
+docker compose run --rm api alembic upgrade head
+docker compose up -d
 ```
+
+The Compose deployment runs five workers from the same API image with separate
+commands: connector `outbox`, `occurrence`, and `result`, plus standardization
+`outbox` and `result`. Worker services disable the image's HTTP health check
+because they do not expose the API port. Inspect them with:
+
+```bash
+docker compose ps
+docker compose logs -f \
+  connector-outbox connector-occurrence connector-result \
+  standardization-outbox standardization-result
+```
+
+Before starting the workers, `.env` must contain the CDK output values for
+`CONNECTOR_DISPATCH_QUEUE_URL`, `CONNECTOR_OCCURRENCE_QUEUE_URL`,
+`CONNECTOR_OCCURRENCE_DLQ_ARN`, `CONNECTOR_RESULT_QUEUE_URL`,
+`CONNECTOR_SCHEDULER_GROUP`, `CONNECTOR_SCHEDULER_ROLE_ARN`,
+`STANDARDIZATION_SOURCE_SECRET_ID`, `STANDARDIZATION_DISPATCH_QUEUE_URL`, and
+`STANDARDIZATION_RESULT_QUEUE_URL`.
+Start with one replica per worker mode; scale only after checking database and
+SQS load.
 
 The API container reads `AWS_REGION` and `SECRET_ID` from `.env`. In deployed
 environments, provide AWS access through an IAM role (ECS task role, EKS pod

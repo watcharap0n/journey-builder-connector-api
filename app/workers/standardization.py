@@ -322,6 +322,7 @@ async def reconcile_partition_once(
                     FROM control.standardization_checkpoint AS checkpoint
                     JOIN control.standardization_run AS run USING (run_id)
                     WHERE run.run_status IN ('PENDING','RUNNING')
+                      AND run.workspace_id IS NOT NULL
                       AND (
                           checkpoint.checkpoint_status = 'FAILED'
                           OR (
@@ -417,6 +418,7 @@ async def reconcile_partition_once(
                     SELECT run.run_id
                     FROM control.standardization_run AS run
                     WHERE run.run_status IN ('PENDING','RUNNING')
+                      AND run.workspace_id IS NOT NULL
                       AND EXISTS (
                           SELECT 1
                           FROM control.standardization_checkpoint AS checkpoint

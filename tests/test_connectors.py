@@ -22,8 +22,10 @@ from app.modules.connectors.schemas import (
 )
 from app.modules.connectors.service import (
     ConnectorConfigurationError,
+    ConnectorConflictError,
     _physical_source_code,
     _validate_mapping_source_paths,
+    queue_operation,
 )
 from app.workers.connectors import _scheduler_bound, _scheduler_expression
 
@@ -196,6 +198,48 @@ def test_preview_request_bounds_and_expired_results() -> None:
         updated_at=now,
     )
     assert _hide_expired_preview_result(view, now=now).result_json == {"expired": True}
+
+
+@pytest.mark.asyncio
+async def test_preview_idempotency_key_cannot_change_limit() -> None:
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    dataset_id = uuid.uuid4()
+    connection = ConnectorConnection(
+        connection_id=connection_id,
+        workspace_id=workspace_id,
+        definition_key="postgresql",
+        name="CRM",
+        source_code="crm",
+        status="READY",
+    )
+    existing = ConnectorOperation(
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        dataset_id=dataset_id,
+        operation_type="DATASET_PREVIEW",
+        trigger_type="MANUAL",
+        idempotency_key="preview-key",
+        request_json={"limit": 10},
+    )
+
+    class Session:
+        def __init__(self) -> None:
+            self.responses = [connection, existing]
+
+        async def scalar(self, _statement: object) -> object:
+            return self.responses.pop(0)
+
+    with pytest.raises(ConnectorConflictError, match="another operation"):
+        await queue_operation(  # type: ignore[arg-type]
+            Session(),  # type: ignore[arg-type]
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            dataset_id=dataset_id,
+            operation_type="DATASET_PREVIEW",
+            idempotency_key="preview-key",
+            request_json={"limit": 20},
+        )
 
 def test_incremental_dataset_requires_cursor_and_primary_key() -> None:
     with pytest.raises(ValidationError, match="primary_key_paths"):

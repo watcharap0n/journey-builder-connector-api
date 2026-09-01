@@ -64,6 +64,10 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: Connection) -> None:
     ensure_version_table(connection)
+    # ensure_version_table starts SQLAlchemy's implicit transaction before
+    # Alembic configures its own transaction. Commit it explicitly so the
+    # migration transaction is not rolled back when the async connection closes.
+    connection.commit()
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

@@ -219,6 +219,13 @@ async def test_reconciler_finalizes_complete_checkpoint_without_result_message()
         for sql, params in session.calls
         if "UPDATE control.standardization_run" in sql
     )
+    reconcile_selects = [
+        sql
+        for sql, _params in session.calls
+        if "FROM control.standardization_" in sql and "run.run_status" in sql
+    ]
+    assert reconcile_selects
+    assert all("run.workspace_id IS NOT NULL" in sql for sql in reconcile_selects)
     assert reconciled is True
     assert run_update["run_status"] == "SUCCEEDED_WITH_WARNINGS"
     assert session.commits == 1
@@ -252,6 +259,12 @@ async def test_reconciler_requeues_stale_running_checkpoint() -> None:
         for sql, params in session.calls
         if "INSERT INTO control.standardization_outbox_event" in sql
     )
+    checkpoint_select = next(
+        sql
+        for sql, _params in session.calls
+        if "FROM control.standardization_checkpoint AS checkpoint" in sql
+    )
+    assert "run.workspace_id IS NOT NULL" in checkpoint_select
     assert reconciled is True
     assert retry_insert["deduplication_key"].endswith(":2")
     assert session.commits == 1

@@ -19,12 +19,17 @@ if config.config_file_name is not None:
 
 settings = get_settings()
 if context.is_offline_mode():
+    database_url = (
+        settings.database_url
+        or "postgresql+asyncpg://offline:offline@localhost/postgres"
+    )
     config.set_main_option(
         "sqlalchemy.url",
-        settings.database_url or "postgresql+asyncpg://offline:offline@localhost/postgres",
+        database_url.replace("%", "%%"),
     )
 else:
-    config.set_main_option("sqlalchemy.url", resolve_database_url_sync(settings))
+    database_url = resolve_database_url_sync(settings)
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 VERSION_TABLE = "journey_builder_api_alembic_version"
 

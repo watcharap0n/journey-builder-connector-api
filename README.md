@@ -115,6 +115,31 @@ The CDK output values map to `CONNECTOR_DISPATCH_QUEUE_URL`,
 `CONNECTOR_SCHEDULER_ROLE_ARN`. Set `CONNECTOR_RUNTIME_WORKSPACE_ID` to limit the
 single-workspace POC runtime while retaining workspace-scoped metadata APIs.
 
+### Manual Elasticsearch standardization
+
+`POST /api/v1/workspaces/{workspace_id}/standardization-datasets/{dataset_id}/runs`
+discovers every populated source index and creates work only where its frozen
+cutoff is ahead of the durable baseline/version watermark. A repeated click
+returns the active run instead of duplicating work. Poll the workspace-scoped
+`GET /standardization-runs/{run_id}` route for aggregate counts.
+
+Run the dedicated control-plane workers separately from connector workers:
+
+```bash
+uv run python -m app.workers.standardization outbox
+uv run python -m app.workers.standardization result
+```
+
+The outbox worker also reconciles partitions whose ECS task stopped without a
+result message. Completed checkpoints finalize the run from durable counts;
+failed or stale running checkpoints are dispatched again up to three worker
+attempts. `STANDARDIZATION_STALE_PARTITION_SECONDS` defaults to 900 seconds.
+
+Configure `STANDARDIZATION_SOURCE_SECRET_ID`,
+`STANDARDIZATION_DISPATCH_QUEUE_URL`, and `STANDARDIZATION_RESULT_QUEUE_URL`
+from the separate standardization runtime stack. There is no schedule or
+restore-status trigger in v1.
+
 Run the complete `api + redis` stack:
 
 ```bash

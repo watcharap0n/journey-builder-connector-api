@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     connector_runtime_workspace_id: str | None = None
     connector_worker_poll_seconds: int = Field(default=10, ge=1, le=300)
 
+    standardization_source_secret_id: str | None = None
+    standardization_source_database: str = "elasticsearch"
+    standardization_source_ssl: bool = True
+    standardization_dispatch_queue_url: str | None = None
+    standardization_result_queue_url: str | None = None
+    standardization_worker_poll_seconds: int = Field(default=10, ge=1, le=300)
+    standardization_stale_partition_seconds: int = Field(
+        default=900, ge=120, le=86400
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

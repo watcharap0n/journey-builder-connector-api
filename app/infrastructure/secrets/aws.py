@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import json
+import os
 from collections.abc import Mapping
+from pathlib import Path
 
 import boto3
 from pydantic import BaseModel, ConfigDict, SecretStr
@@ -38,6 +40,24 @@ def build_database_url(secret: DatabaseSecret) -> str:
     ).render_as_string(hide_password=False)
 
 
+def _is_container_runtime() -> bool:
+    return Path("/.dockerenv").exists() or bool(
+        os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+        or os.environ.get("ECS_CONTAINER_METADATA_URI")
+    )
+
+
+def _normalize_runtime_host(url: str, settings: Settings) -> str:
+    parsed = make_url(url)
+    if (
+        settings.app_env.lower() == "local"
+        and parsed.host == "host.docker.internal"
+        and not _is_container_runtime()
+    ):
+        parsed = parsed.set(host="127.0.0.1")
+    return parsed.render_as_string(hide_password=False)
+
+
 def parse_database_secret(secret_value: str) -> DatabaseSecret:
     try:
         payload = json.loads(secret_value)
@@ -60,12 +80,13 @@ def _read_secret_value(response: Mapping[str, object]) -> str:
 
 def resolve_database_url_sync(settings: Settings) -> str:
     if settings.database_url:
-        return _as_asyncpg_url(settings.database_url)
+        return _normalize_runtime_host(_as_asyncpg_url(settings.database_url), settings)
 
     if settings.database_secret_id:
         client = boto3.client("secretsmanager", region_name=settings.aws_region)
         response = client.get_secret_value(SecretId=settings.database_secret_id)
-        return build_database_url(parse_database_secret(_read_secret_value(response)))
+        url = build_database_url(parse_database_secret(_read_secret_value(response)))
+        return _normalize_runtime_host(url, settings)
 
     raise RuntimeError(
         "Database configuration is missing: set DATABASE_URL or DATABASE_SECRET_ID/SECRET_ID"

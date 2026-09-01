@@ -12,6 +12,7 @@ services:
       retries: 10
 
   api:
+    image: ${JOURNEY_BUILDER_API_IMAGE:-journey-builder-api:local}
     build: .
     env_file:
       - .env
@@ -22,6 +23,51 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    restart: unless-stopped
+
+  connector-outbox:
+    image: ${JOURNEY_BUILDER_API_IMAGE:-journey-builder-api:local}
+    env_file:
+      - .env
+    command: ["python", "-m", "app.workers.connectors", "outbox"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  connector-occurrence:
+    image: ${JOURNEY_BUILDER_API_IMAGE:-journey-builder-api:local}
+    env_file:
+      - .env
+    command: ["python", "-m", "app.workers.connectors", "occurrence"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  connector-result:
+    image: ${JOURNEY_BUILDER_API_IMAGE:-journey-builder-api:local}
+    env_file:
+      - .env
+    command: ["python", "-m", "app.workers.connectors", "result"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  standardization-outbox:
+    image: ${JOURNEY_BUILDER_API_IMAGE:-journey-builder-api:local}
+    env_file:
+      - .env
+    command: ["python", "-m", "app.workers.standardization", "outbox"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+  standardization-result:
+    image: ${JOURNEY_BUILDER_API_IMAGE:-journey-builder-api:local}
+    env_file:
+      - .env
+    command: ["python", "-m", "app.workers.standardization", "result"]
+    healthcheck:
+      disable: true
     restart: unless-stopped
 
 volumes:

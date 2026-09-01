@@ -32,6 +32,21 @@ else:
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 VERSION_TABLE = "journey_builder_api_alembic_version"
+VERSION_TABLE_LENGTH = 128
+
+
+def ensure_version_table(connection: Connection) -> None:
+    connection.exec_driver_sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {VERSION_TABLE} (
+            version_num VARCHAR({VERSION_TABLE_LENGTH}) NOT NULL,
+            CONSTRAINT {VERSION_TABLE}_pk PRIMARY KEY (version_num)
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        f"ALTER TABLE {VERSION_TABLE} ALTER COLUMN version_num TYPE VARCHAR({VERSION_TABLE_LENGTH})"
+    )
 
 
 def run_migrations_offline() -> None:
@@ -48,6 +63,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    ensure_version_table(connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
@@ -15,6 +16,7 @@ from app.modules.connectors.schemas import (
     ConnectionUpdate,
     ConnectionView,
     CredentialUpdate,
+    DatasetPreviewRequest,
     DatasetUpdate,
     DatasetView,
     MappingCreate,
@@ -50,6 +52,16 @@ router = APIRouter(tags=["database-connectors"])
 SessionDep = Annotated[AsyncSession, Depends(get_db_session)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key")]
+
+
+def _hide_expired_preview_result(view: OperationView, *, now: datetime) -> OperationView:
+    if (
+        view.operation_type == "DATASET_PREVIEW"
+        and view.result_expires_at is not None
+        and view.result_expires_at <= now
+    ):
+        return view.model_copy(update={"result_json": {"expired": True}})
+    return view
 
 
 def _translate_error(exc: Exception) -> HTTPException:
@@ -246,6 +258,36 @@ async def patch_dataset(
 
 
 @router.post(
+    "/workspaces/{workspace_id}/datasets/{dataset_id}/preview",
+    response_model=OperationAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def post_dataset_preview(
+    workspace_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    payload: DatasetPreviewRequest,
+    session: SessionDep,
+    idempotency_key: IdempotencyKey = None,
+) -> OperationAccepted:
+    try:
+        dataset = await ConnectorRepository(session).get_dataset(workspace_id, dataset_id)
+        if dataset is None:
+            raise ConnectorNotFoundError("dataset not found")
+        operation = await queue_operation(
+            session,
+            workspace_id=workspace_id,
+            connection_id=dataset.connection_id,
+            dataset_id=dataset_id,
+            operation_type="DATASET_PREVIEW",
+            idempotency_key=idempotency_key,
+            request_json={"limit": payload.limit},
+        )
+        return OperationAccepted(operation_id=operation.operation_id, status=operation.status)
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post(
     "/workspaces/{workspace_id}/datasets/{dataset_id}/mappings",
     response_model=MappingView,
     status_code=status.HTTP_201_CREATED,
@@ -365,7 +407,8 @@ async def get_operation(
     row = await ConnectorRepository(session).get_operation(workspace_id, operation_id)
     if row is None:
         raise HTTPException(status_code=404, detail="operation not found")
-    return OperationView.model_validate(row)
+    view = OperationView.model_validate(row)
+    return _hide_expired_preview_result(view, now=datetime.now(UTC))
 
 
 @router.get(

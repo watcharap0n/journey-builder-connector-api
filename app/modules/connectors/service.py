@@ -21,6 +21,7 @@ from app.modules.connectors.model import (
     ConnectorSchedule,
     MappingVersion,
     OutboxEvent,
+    SchemaSnapshot,
     SyncRun,
     Workspace,
 )
@@ -65,6 +66,38 @@ def _canonical_hash(value: Any) -> str:
 
 def _physical_source_code(workspace_id: uuid.UUID, source_code: str) -> str:
     return f"w{workspace_id.hex[:8]}_{source_code}"[:63]
+
+
+def _validate_mapping_source_paths(
+    schema_json: dict[str, Any], payload: MappingCreate
+) -> None:
+    columns = schema_json.get("columns", [])
+    available_paths = {
+        str(column.get("name"))
+        for column in columns
+        if isinstance(column, dict) and column.get("name")
+    }
+    nested_roots = {
+        str(column.get("name"))
+        for column in columns
+        if isinstance(column, dict)
+        and column.get("name")
+        and str(column.get("type", "")).lower()
+        in {"json", "jsonb", "object", "document", "embedded document"}
+    }
+    invalid_paths = sorted(
+        {
+            field.source_path
+            for field in payload.fields
+            if field.source_path not in available_paths
+            and not any(field.source_path.startswith(f"{root}.") for root in nested_roots)
+        }
+    )
+    if invalid_paths:
+        raise ConnectorConfigurationError(
+            "mapping source_path values are not present in schema snapshot: "
+            + ", ".join(invalid_paths)
+        )
 
 
 def _outbox(
@@ -248,6 +281,7 @@ async def queue_operation(
     dataset_id: uuid.UUID | None = None,
     idempotency_key: str | None = None,
     trigger_type: str = "MANUAL",
+    request_json: dict[str, Any] | None = None,
 ) -> ConnectorOperation:
     repository = ConnectorRepository(session)
     connection = await repository.get_connection(workspace_id, connection_id)
@@ -263,10 +297,12 @@ async def queue_operation(
         )
     )
     if existing is not None:
+        resolved_request_json = request_json or {}
         if (
             existing.connection_id != connection_id
             or existing.dataset_id != dataset_id
             or existing.operation_type != operation_type
+            or existing.request_json != resolved_request_json
         ):
             raise ConnectorConflictError("idempotency key was used for another operation")
         return existing
@@ -277,6 +313,7 @@ async def queue_operation(
         operation_type=operation_type,
         trigger_type=trigger_type,
         idempotency_key=resolved_idempotency_key,
+        request_json=request_json or {},
     )
     session.add(operation)
     await session.flush()
@@ -332,13 +369,16 @@ async def create_mapping(
     dataset = await repository.get_dataset(workspace_id, dataset_id)
     if dataset is None:
         raise ConnectorNotFoundError("dataset not found")
-    snapshot_exists = await session.scalar(
-        select(text("1")).select_from(text("connector.schema_snapshot")).where(
-            text("schema_snapshot_id = :snapshot_id AND dataset_id = :dataset_id")
-        ).params(snapshot_id=payload.schema_snapshot_id, dataset_id=dataset_id)
+    snapshot = await session.scalar(
+        select(SchemaSnapshot).where(
+            SchemaSnapshot.schema_snapshot_id == payload.schema_snapshot_id,
+            SchemaSnapshot.dataset_id == dataset_id,
+            SchemaSnapshot.workspace_id == workspace_id,
+        )
     )
-    if snapshot_exists is None:
+    if snapshot is None:
         raise ConnectorConfigurationError("schema snapshot does not belong to dataset")
+    _validate_mapping_source_paths(snapshot.schema_json, payload)
     mapping_json = {"fields": [field.model_dump(mode="json") for field in payload.fields]}
     mapping = MappingVersion(
         workspace_id=workspace_id,

@@ -117,6 +117,8 @@ class ConnectorDataset(Base, TimestampMixin):
     cursor_paths: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     soft_delete_path: Mapped[str | None] = mapped_column(String(500))
     active_mapping_version_id: Mapped[uuid.UUID | None] = mapped_column()
+    row_count_estimate: Mapped[int | None] = mapped_column(BigInteger)
+    row_count_estimated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="DISCOVERED")
 
 
@@ -206,7 +208,8 @@ class ConnectorOperation(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("workspace_id", "idempotency_key", name="uq_operation_idempotency"),
         CheckConstraint(
-            "operation_type IN ('CONNECTION_TEST','SCHEMA_DISCOVERY','DATASET_SYNC')",
+            "operation_type IN "
+            "('CONNECTION_TEST','SCHEMA_DISCOVERY','DATASET_PREVIEW','DATASET_SYNC')",
             name="operation_type",
         ),
         CheckConstraint(
@@ -236,7 +239,9 @@ class ConnectorOperation(Base, TimestampMixin):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(100))
     error_message: Mapped[str | None] = mapped_column(Text)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ScheduleOccurrence(Base):

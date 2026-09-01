@@ -5,8 +5,6 @@ Revises:
 Create Date: 2026-08-29
 """
 
-from sqlalchemy import DDL
-
 from alembic import op
 
 revision = "001_connector_control_plane"
@@ -283,10 +281,13 @@ CREATE INDEX ix_outbox_pending
     ON connector.outbox_event(status, available_at)
     WHERE status IN ('PENDING','FAILED','PROCESSING');
 """
+def _execute_sql_block(sql_block: str) -> None:
+    for statement in (chunk.strip() for chunk in sql_block.split(";") if chunk.strip()):
+        op.execute(statement)
 
 
 def upgrade() -> None:
-    op.execute(DDL(DDL_STATEMENTS))
+    _execute_sql_block(DDL_STATEMENTS)
 
 
 def downgrade() -> None:

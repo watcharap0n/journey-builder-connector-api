@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import boto3
 from botocore.exceptions import ClientError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import Settings, get_settings
@@ -27,6 +27,18 @@ from app.modules.connectors.model import (
 from app.modules.connectors.service import ActiveSyncRunError, materialize_sync_run
 
 LOGGER = logging.getLogger(__name__)
+
+
+async def cleanup_expired_preview_results(session: AsyncSession) -> None:
+    await session.execute(
+        update(ConnectorOperation)
+        .where(
+            ConnectorOperation.operation_type == "DATASET_PREVIEW",
+            ConnectorOperation.result_expires_at.is_not(None),
+            ConnectorOperation.result_expires_at <= datetime.now(UTC),
+        )
+        .values(result_json={"expired": True}, result_expires_at=None)
+    )
 
 
 def _scheduler_expression(timing: dict[str, Any]) -> str:
@@ -168,6 +180,8 @@ async def process_outbox_once(
     session_factory: async_sessionmaker[AsyncSession], settings: Settings
 ) -> bool:
     async with session_factory() as session:
+        await cleanup_expired_preview_results(session)
+        await session.commit()
         async with session.begin():
             event = await session.scalar(
                 select(OutboxEvent)

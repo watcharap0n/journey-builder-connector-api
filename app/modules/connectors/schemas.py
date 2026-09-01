@@ -153,6 +153,8 @@ class DatasetView(ViewModel):
     cursor_paths: list[str]
     soft_delete_path: str | None
     active_mapping_version_id: uuid.UUID | None
+    row_count_estimate: int | None
+    row_count_estimated_at: datetime | None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -206,6 +208,10 @@ class MappingView(ViewModel):
     status: str
     created_at: datetime
     published_at: datetime | None
+
+
+class DatasetPreviewRequest(BaseModel):
+    limit: int = Field(default=10, ge=1, le=50)
 
 
 class RecurringTiming(BaseModel):
@@ -282,6 +288,7 @@ class OperationView(ViewModel):
     error_code: str | None
     error_message: str | None
     result_json: dict[str, Any]
+    result_expires_at: datetime | None
     created_at: datetime
     updated_at: datetime
 

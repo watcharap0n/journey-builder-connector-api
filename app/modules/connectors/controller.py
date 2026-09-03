@@ -120,6 +120,26 @@ async def get_connections(
     return [ConnectionView.model_validate(row) for row in rows]
 
 
+@router.get(
+    "/workspaces/{workspace_id}/connectors/{connection_id}",
+    response_model=ConnectionView,
+)
+async def get_connection_by_id(
+    workspace_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    session: SessionDep,
+) -> ConnectionView:
+    try:
+        connection = await ConnectorRepository(session).get_connection(
+            workspace_id, connection_id
+        )
+        if connection is None:
+            raise ConnectorNotFoundError("connector not found")
+        return ConnectionView.model_validate(connection)
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
 @router.patch(
     "/workspaces/{workspace_id}/connectors/{connection_id}",
     response_model=ConnectionView,

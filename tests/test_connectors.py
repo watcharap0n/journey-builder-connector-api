@@ -118,6 +118,79 @@ def test_ssh_tunnel_rejects_uri_and_multiple_database_hosts() -> None:
         SourceCredentials(hosts=["db-1.internal", "db-2.internal"], tunnel=tunnel)
 
 
+@pytest.mark.asyncio
+async def test_get_connection_by_id_is_workspace_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    captured: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
+    now = datetime.now(UTC)
+
+    class FakeRepository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def get_connection(
+            self,
+            requested_workspace_id: uuid.UUID,
+            requested_connection_id: uuid.UUID,
+        ) -> Any:
+            captured["lookup"] = (requested_workspace_id, requested_connection_id)
+            return SimpleNamespace(
+                connection_id=connection_id,
+                workspace_id=workspace_id,
+                definition_key="postgresql",
+                name="Customer PostgreSQL",
+                source_code="customer_postgres",
+                endpoint_label=None,
+                source_system_id=None,
+                safe_config={"display_color": "blue"},
+                status="DRAFT",
+                last_tested_at=None,
+                last_error_code=None,
+                created_at=now,
+                updated_at=now,
+            )
+
+    monkeypatch.setattr(controller, "ConnectorRepository", FakeRepository)
+
+    result = await controller.get_connection_by_id(
+        workspace_id,
+        connection_id,
+        object(),  # type: ignore[arg-type]
+    )
+
+    assert captured["lookup"] == (workspace_id, connection_id)
+    assert result.connection_id == connection_id
+    assert result.safe_config == {"display_color": "blue"}
+
+
+@pytest.mark.asyncio
+async def test_get_connection_by_id_returns_404_when_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MissingRepository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def get_connection(
+            self, _workspace_id: uuid.UUID, _connection_id: uuid.UUID
+        ) -> None:
+            return None
+
+    monkeypatch.setattr(controller, "ConnectorRepository", MissingRepository)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await controller.get_connection_by_id(
+            uuid.uuid4(),
+            uuid.uuid4(),
+            object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 404
+
+
 def test_mapping_requires_source_customer_id() -> None:
     with pytest.raises(ValidationError, match="source_customer_id"):
         MappingCreate(
@@ -374,6 +447,9 @@ def test_operation_type_constraint_allows_dataset_preview() -> None:
 def test_openapi_exposes_workspace_scoped_connector_routes(settings) -> None:
     paths = create_app(settings).openapi()["paths"]
     assert "/api/v1/workspaces/{workspace_id}/connectors" in paths
+    assert (
+        "/api/v1/workspaces/{workspace_id}/connectors/{connection_id}" in paths
+    )
     assert (
         "/api/v1/workspaces/{workspace_id}/datasets/{dataset_id}/schema-snapshots"
         in paths

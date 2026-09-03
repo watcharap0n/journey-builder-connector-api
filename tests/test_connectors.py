@@ -41,11 +41,81 @@ def test_credentials_are_write_only_in_connection_contract() -> None:
             username="reader",
             password="do-not-render",
             database="crm",
+            tunnel={
+                "type": "ssh",
+                "host": "bastion.example.com",
+                "username": "ubuntu",
+                "private_key": "private-key-material",
+                "private_key_passphrase": "key-passphrase",
+                "host_key": "ssh-ed25519 AAAA-test",
+            },
         ),
     )
     secret = payload.credentials.secret_payload()
     assert secret["password"] == "do-not-render"
+    assert secret["tunnel"]["private_key"] == "private-key-material"
+    assert secret["tunnel"]["private_key_passphrase"] == "key-passphrase"
     assert "credentials" not in ConnectorConnection.__table__.columns
+
+
+def test_ssh_tunnel_accepts_password_authentication() -> None:
+    credentials = SourceCredentials(
+        host="db.internal",
+        port=5432,
+        username="reader",
+        password="database-password",
+        database="crm",
+        tunnel={
+            "host": "bastion.example.com",
+            "username": "ubuntu",
+            "password": "ssh-password",
+        },
+    )
+
+    secret = credentials.secret_payload()
+    assert secret["tunnel"] == {
+        "type": "ssh",
+        "host": "bastion.example.com",
+        "port": 22,
+        "username": "ubuntu",
+        "password": "ssh-password",
+    }
+
+
+@pytest.mark.parametrize(
+    "tunnel",
+    [
+        {"host": "bastion.example.com", "username": "ubuntu"},
+        {"host": "bastion.example.com", "username": "ubuntu", "password": ""},
+        {
+            "host": "bastion.example.com",
+            "username": "ubuntu",
+            "private_key": "key",
+            "password": "password",
+        },
+        {
+            "host": "bastion.example.com",
+            "username": "ubuntu",
+            "password": "password",
+            "private_key_passphrase": "orphan-passphrase",
+        },
+    ],
+)
+def test_ssh_tunnel_rejects_invalid_authentication(tunnel: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        SourceCredentials(host="db.internal", tunnel=tunnel)
+
+
+def test_ssh_tunnel_rejects_uri_and_multiple_database_hosts() -> None:
+    tunnel = {
+        "host": "bastion.example.com",
+        "username": "ubuntu",
+        "password": "ssh-password",
+    }
+    with pytest.raises(ValidationError, match="not uri"):
+        SourceCredentials(uri="postgresql://db.example.com/crm", tunnel=tunnel)
+    with pytest.raises(ValidationError, match="multiple database hosts"):
+        SourceCredentials(hosts=["db-1.internal", "db-2.internal"], tunnel=tunnel)
 
 
 def test_mapping_requires_source_customer_id() -> None:

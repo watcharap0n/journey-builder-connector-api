@@ -63,7 +63,48 @@ class WorkspaceView(ViewModel):
     updated_at: datetime
 
 
+class SshTunnelCredentials(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["ssh"] = "ssh"
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=255)
+    private_key: SecretStr | None = None
+    password: SecretStr | None = None
+    private_key_passphrase: SecretStr | None = None
+    host_key: str | None = Field(default=None, min_length=1, max_length=16_384)
+
+    @model_validator(mode="after")
+    def validate_authentication(self) -> SshTunnelCredentials:
+        auth_methods = int(self.private_key is not None) + int(self.password is not None)
+        if auth_methods != 1:
+            raise ValueError("SSH tunnel requires exactly one of private_key or password")
+        if self.private_key is not None and not self.private_key.get_secret_value().strip():
+            raise ValueError("SSH private_key must not be empty")
+        if self.password is not None and not self.password.get_secret_value():
+            raise ValueError("SSH password must not be empty")
+        if self.private_key_passphrase is not None and self.private_key is None:
+            raise ValueError("private_key_passphrase requires private_key")
+        return self
+
+    def secret_payload(self) -> dict[str, Any]:
+        payload = self.model_dump(
+            exclude_none=True,
+            exclude={"private_key", "password", "private_key_passphrase"},
+        )
+        if self.private_key is not None:
+            payload["private_key"] = self.private_key.get_secret_value()
+        if self.password is not None:
+            payload["password"] = self.password.get_secret_value()
+        if self.private_key_passphrase is not None:
+            payload["private_key_passphrase"] = self.private_key_passphrase.get_secret_value()
+        return payload
+
+
 class SourceCredentials(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     host: str | None = None
     hosts: list[str] = Field(default_factory=list)
     port: int | None = Field(default=None, ge=1, le=65535)
@@ -72,19 +113,31 @@ class SourceCredentials(BaseModel):
     database: str | None = None
     uri: SecretStr | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    tunnel: SshTunnelCredentials | None = None
 
     @model_validator(mode="after")
     def validate_endpoint(self) -> SourceCredentials:
         if self.uri is None and self.host is None and not self.hosts:
             raise ValueError("credentials require uri, host, or hosts")
+        if self.tunnel is not None and self.uri is not None:
+            raise ValueError("SSH tunnel requires host or a single hosts entry, not uri")
+        if self.tunnel is not None and len(self.hosts) > 1:
+            raise ValueError("SSH tunnel does not support multiple database hosts")
+        if self.tunnel is not None and self.host is None and len(self.hosts) != 1:
+            raise ValueError("SSH tunnel requires exactly one database host")
         return self
 
     def secret_payload(self) -> dict[str, Any]:
-        payload = self.model_dump(exclude_none=True)
+        payload = self.model_dump(
+            exclude_none=True,
+            exclude={"password", "uri", "tunnel"},
+        )
         if self.password is not None:
             payload["password"] = self.password.get_secret_value()
         if self.uri is not None:
             payload["uri"] = self.uri.get_secret_value()
+        if self.tunnel is not None:
+            payload["tunnel"] = self.tunnel.secret_payload()
         return payload
 
 
@@ -217,9 +270,9 @@ class DatasetPreviewRequest(BaseModel):
 class RecurringTiming(BaseModel):
     frequency: Literal["daily", "weekly", "monthly"]
     time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    days_of_week: list[
-        Literal["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-    ] = Field(default_factory=list)
+    days_of_week: list[Literal["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]] = Field(
+        default_factory=list
+    )
     day_of_month: int | None = Field(default=None, ge=1, le=31)
 
     @model_validator(mode="after")

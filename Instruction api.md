@@ -97,7 +97,12 @@ Example MongoDB connection configuration:
 }
 ```
 
-Configure Tunneling for PostgreSQL, MySQL, and MariaDB connections:
+Configure SSH tunneling for PostgreSQL, MySQL, MariaDB, or a single-host MongoDB
+connection. The database `host` is resolved from the bastion, while
+`tunnel.host` identifies the SSH bastion.
+
+Private-key authentication:
+
 ```json
 {
   "engine": "postgresql",
@@ -119,9 +124,29 @@ Configure Tunneling for PostgreSQL, MySQL, and MariaDB connections:
       "host": "43.210.220.193",
       "port": 22,
       "username": "ubuntu",
-      "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----", # password 
-      "host_key": "optional-known-host-key" 
+      "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
+      "private_key_passphrase": null,
+      "host_key": "ssh-ed25519 AAAA..."
     }
   }
 }
 ```
+
+SSH-password authentication uses the same payload but replaces `private_key`
+and `private_key_passphrase` with a tunnel-level password:
+
+```json
+"tunnel": {
+  "type": "ssh",
+  "host": "43.210.220.193",
+  "port": 22,
+  "username": "ubuntu",
+  "password": "ssh-password",
+  "host_key": "ssh-ed25519 AAAA..."
+}
+```
+
+The `tunnel` object is optional. When present, exactly one of `private_key` or
+`password` is required. `host_key` is optional for POC use but recommended for
+host verification. URI and multi-host source credentials cannot be combined
+with one SSH tunnel.

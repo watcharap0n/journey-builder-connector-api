@@ -106,6 +106,12 @@ Dataset discovery records an approximate row count without running a full
 `COUNT(*)`. Preview operations default to 10 rows (maximum 50); poll the normal
 operation endpoint and consume `result_json` before its 15-minute expiry.
 
+Source credentials may include an optional `tunnel` object for SSH forwarding.
+SSH authentication supports exactly one of `private_key` or `password`, plus an
+optional `private_key_passphrase`. `host_key` accepts a known-hosts key line and
+should be supplied outside disposable POC environments. A tunneled source must
+use one database `host`; URI and multi-host connection forms are rejected.
+
 Run background processes separately from API replicas:
 
 ```bash

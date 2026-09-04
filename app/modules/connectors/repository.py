@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.connectors.model import (
@@ -17,6 +18,15 @@ from app.modules.connectors.model import (
     SyncRun,
     Workspace,
 )
+
+
+@dataclass(frozen=True)
+class ConnectionSummary:
+    connection: ConnectorConnection
+    successful_records: int
+    error_records: int
+    duplicate_records: int
+    frequency: str
 
 
 class ConnectorRepository:
@@ -33,6 +43,84 @@ class ConnectorRepository:
             .order_by(ConnectorConnection.created_at.desc())
         )
         return result.all()
+
+    async def list_connection_summaries(
+        self, workspace_id: uuid.UUID
+    ) -> Sequence[ConnectionSummary]:
+        connections = await self.list_connections(workspace_id)
+        run_rows = await self.session.execute(
+            select(
+                ConnectorDataset.connection_id,
+                func.sum(SyncRun.records_read).label("records_read"),
+                func.sum(SyncRun.records_loaded).label("records_loaded"),
+                func.sum(SyncRun.records_rejected).label("records_rejected"),
+            )
+            .join(
+                SyncRun,
+                and_(
+                    SyncRun.dataset_id == ConnectorDataset.dataset_id,
+                    SyncRun.workspace_id == ConnectorDataset.workspace_id,
+                ),
+            )
+            .where(
+                ConnectorDataset.workspace_id == workspace_id,
+                SyncRun.status == "SUCCEEDED",
+            )
+            .group_by(ConnectorDataset.connection_id)
+        )
+        run_totals = {
+            row.connection_id: (
+                int(row.records_read or 0),
+                int(row.records_loaded or 0),
+                int(row.records_rejected or 0),
+            )
+            for row in run_rows
+        }
+
+        schedule_rows = await self.session.execute(
+            select(ConnectorDataset.connection_id, ConnectorSchedule.timing_json).join(
+                ConnectorSchedule,
+                and_(
+                    ConnectorSchedule.dataset_id == ConnectorDataset.dataset_id,
+                    ConnectorSchedule.workspace_id == ConnectorDataset.workspace_id,
+                ),
+            )
+            .where(
+                ConnectorDataset.workspace_id == workspace_id,
+                ConnectorSchedule.status != "DISABLED",
+            )
+        )
+        frequencies: dict[uuid.UUID, set[str]] = {}
+        for row in schedule_rows:
+            frequency = str((row.timing_json or {}).get("frequency", ""))
+            if frequency:
+                frequencies.setdefault(row.connection_id, set()).add(frequency)
+
+        summaries: list[ConnectionSummary] = []
+        for connection in connections:
+            records_read, records_loaded, records_rejected = run_totals.get(
+                connection.connection_id, (0, 0, 0)
+            )
+            configured_frequencies = frequencies.get(connection.connection_id, set())
+            frequency = (
+                next(iter(configured_frequencies))
+                if len(configured_frequencies) == 1
+                else "mixed"
+                if configured_frequencies
+                else "manual"
+            )
+            summaries.append(
+                ConnectionSummary(
+                    connection=connection,
+                    successful_records=records_loaded,
+                    error_records=records_rejected,
+                    duplicate_records=max(
+                        records_read - records_loaded - records_rejected, 0
+                    ),
+                    frequency=frequency,
+                )
+            )
+        return summaries
 
     async def get_connection(
         self, workspace_id: uuid.UUID, connection_id: uuid.UUID

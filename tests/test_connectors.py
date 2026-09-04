@@ -27,7 +27,11 @@ from app.modules.connectors.service import (
     _validate_mapping_source_paths,
     queue_operation,
 )
-from app.workers.connectors import _scheduler_bound, _scheduler_expression
+from app.workers.connectors import (
+    _scheduler_bound,
+    _scheduler_expression,
+    _scheduler_start_bound,
+)
 
 
 def test_credentials_are_write_only_in_connection_contract() -> None:
@@ -164,6 +168,68 @@ async def test_get_connection_by_id_is_workspace_scoped(
     assert captured["lookup"] == (workspace_id, connection_id)
     assert result.connection_id == connection_id
     assert result.safe_config == {"display_color": "blue"}
+
+
+@pytest.mark.asyncio
+async def test_get_connections_includes_record_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    now = datetime.now(UTC)
+
+    async def fake_get_workspace(_session: object, requested_workspace_id: uuid.UUID) -> object:
+        assert requested_workspace_id == workspace_id
+        return object()
+
+    class FakeRepository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def list_connection_summaries(
+            self, requested_workspace_id: uuid.UUID
+        ) -> list[SimpleNamespace]:
+            assert requested_workspace_id == workspace_id
+            connection = SimpleNamespace(
+                connection_id=connection_id,
+                workspace_id=workspace_id,
+                definition_key="postgresql",
+                name="Customer PostgreSQL",
+                source_code="customer_postgres",
+                endpoint_label=None,
+                source_system_id=2212,
+                safe_config={},
+                status="READY",
+                last_tested_at=now,
+                last_error_code=None,
+                created_at=now,
+                updated_at=now,
+            )
+            return [
+                SimpleNamespace(
+                    connection=connection,
+                    successful_records=105_636,
+                    error_records=4,
+                    duplicate_records=423,
+                    frequency="daily",
+                )
+            ]
+
+    monkeypatch.setattr(controller, "get_workspace", fake_get_workspace)
+    monkeypatch.setattr(controller, "ConnectorRepository", FakeRepository)
+
+    result = await controller.get_connections(workspace_id, object())  # type: ignore[arg-type]
+
+    assert result[0].successful_records == 105_636
+    assert result[0].error_records == 4
+    assert result[0].duplicate_records == 423
+    assert result[0].frequency == "daily"
+
+
+def test_sync_run_derives_duplicate_records() -> None:
+    run = SyncRun(records_read=110, records_loaded=100, records_rejected=4)
+
+    assert run.records_duplicate == 6
 
 
 @pytest.mark.asyncio
@@ -416,6 +482,26 @@ def test_recurring_schedule_validates_timezone_and_frequency() -> None:
     assert _scheduler_bound(
         date(2026, 8, 29), "Asia/Bangkok", end_of_day=False
     ).isoformat() == "2026-08-28T17:00:00+00:00"
+
+
+def test_scheduler_start_bound_uses_local_schedule_time() -> None:
+    timing = {"frequency": "daily", "time": "10:30"}
+
+    assert _scheduler_start_bound(
+        date(2026, 9, 4),
+        timing,
+        "Asia/Bangkok",
+        now=datetime(2026, 9, 4, 3, 24, tzinfo=UTC),
+    ) == datetime(2026, 9, 4, 3, 30, tzinfo=UTC)
+
+
+def test_scheduler_start_bound_omits_elapsed_time() -> None:
+    assert _scheduler_start_bound(
+        date(2026, 9, 4),
+        {"frequency": "daily", "time": "10:30"},
+        "Asia/Bangkok",
+        now=datetime(2026, 9, 4, 3, 31, tzinfo=UTC),
+    ) is None
 
 
 def test_physical_source_code_is_workspace_scoped_and_bounded() -> None:

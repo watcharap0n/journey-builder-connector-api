@@ -59,6 +59,22 @@ def _scheduler_bound(value: date, timezone: str, *, end_of_day: bool) -> datetim
     return datetime.combine(value, local_time, tzinfo=ZoneInfo(timezone)).astimezone(UTC)
 
 
+def _scheduler_start_bound(
+    value: date,
+    timing: dict[str, Any],
+    timezone: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    hour, minute = (int(part) for part in str(timing["time"]).split(":", 1))
+    start = datetime.combine(
+        value,
+        time(hour=hour, minute=minute),
+        tzinfo=ZoneInfo(timezone),
+    ).astimezone(UTC)
+    return start if start > (now or datetime.now(UTC)) else None
+
+
 async def _queue_arn(settings: Settings, queue_url: str) -> str:
     client = boto3.client("sqs", region_name=settings.aws_region)
     response = await asyncio.to_thread(
@@ -144,15 +160,6 @@ async def _sync_aws_schedule(
         },
         **(
             {
-                "StartDate": _scheduler_bound(
-                    schedule.start_date, schedule.timezone, end_of_day=False
-                )
-            }
-            if schedule.start_date
-            else {}
-        ),
-        **(
-            {
                 "EndDate": _scheduler_bound(
                     schedule.end_date, schedule.timezone, end_of_day=True
                 )
@@ -161,6 +168,14 @@ async def _sync_aws_schedule(
             else {}
         ),
     }
+    if schedule.start_date:
+        start_date = _scheduler_start_bound(
+            schedule.start_date,
+            schedule.timing_json,
+            schedule.timezone,
+        )
+        if start_date:
+            request["StartDate"] = start_date
     if not settings.connector_occurrence_dlq_arn:
         request["Target"].pop("DeadLetterConfig")
     try:

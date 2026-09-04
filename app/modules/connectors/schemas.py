@@ -177,6 +177,13 @@ class ConnectionView(ViewModel):
     updated_at: datetime
 
 
+class ConnectionListView(ConnectionView):
+    successful_records: int = Field(ge=0)
+    error_records: int = Field(ge=0)
+    duplicate_records: int = Field(ge=0)
+    frequency: Literal["daily", "weekly", "monthly", "mixed", "manual"]
+
+
 class DatasetUpdate(BaseModel):
     sync_mode: Literal["FULL_SNAPSHOT", "INCREMENTAL"] | None = None
     primary_key_paths: list[str] | None = None
@@ -363,6 +370,7 @@ class SyncRunView(ViewModel):
     records_read: int
     records_loaded: int
     records_rejected: int
+    records_duplicate: int
     bytes_written: int
     started_at: datetime | None
     completed_at: datetime | None

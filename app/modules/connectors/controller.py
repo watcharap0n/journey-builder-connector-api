@@ -13,6 +13,7 @@ from app.infrastructure.database.session import get_db_session
 from app.modules.connectors.repository import ConnectorRepository
 from app.modules.connectors.schemas import (
     ConnectionCreate,
+    ConnectionListView,
     ConnectionUpdate,
     ConnectionView,
     CredentialUpdate,
@@ -110,14 +111,23 @@ async def post_connection(
 
 
 @router.get(
-    "/workspaces/{workspace_id}/connectors", response_model=list[ConnectionView]
+    "/workspaces/{workspace_id}/connectors", response_model=list[ConnectionListView]
 )
 async def get_connections(
     workspace_id: uuid.UUID, session: SessionDep
-) -> Sequence[ConnectionView]:
+) -> Sequence[ConnectionListView]:
     await get_workspace(session, workspace_id)
-    rows = await ConnectorRepository(session).list_connections(workspace_id)
-    return [ConnectionView.model_validate(row) for row in rows]
+    rows = await ConnectorRepository(session).list_connection_summaries(workspace_id)
+    return [
+        ConnectionListView(
+            **ConnectionView.model_validate(row.connection).model_dump(),
+            successful_records=row.successful_records,
+            error_records=row.error_records,
+            duplicate_records=row.duplicate_records,
+            frequency=row.frequency,
+        )
+        for row in rows
+    ]
 
 
 @router.get(

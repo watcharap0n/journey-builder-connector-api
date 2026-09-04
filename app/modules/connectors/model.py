@@ -319,6 +319,10 @@ class SyncRun(Base):
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
 
+    @property
+    def records_duplicate(self) -> int:
+        return max(self.records_read - self.records_loaded - self.records_rejected, 0)
+
 
 class SyncPartition(Base):
     __tablename__ = "sync_partition"

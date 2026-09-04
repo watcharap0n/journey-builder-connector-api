@@ -118,15 +118,38 @@ def test_connector_fast_operation_defaults() -> None:
 
 @pytest.mark.parametrize(
     "queue_url",
-    [None, "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast-operations"],
+    [
+        None,
+        "",
+        "not-a-url",
+        "https://example.com/123456789012/fast-operations",
+        "https://sqs.ap-southeast-1.amazonaws.com/not-an-account/fast-operations",
+        "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast.fifo",
+    ],
 )
-def test_enabled_fast_operations_require_fifo_queue_url(queue_url: str | None) -> None:
+def test_enabled_fast_operations_require_standard_sqs_queue_url(
+    queue_url: str | None,
+) -> None:
     with pytest.raises(ValidationError, match="CONNECTOR_FAST_OPERATION_QUEUE_URL"):
         Settings(
             _env_file=None,
             connector_fast_operations_enabled=True,
             connector_fast_operation_queue_url=queue_url,
         )
+
+
+def test_enabled_fast_operations_accept_standard_sqs_queue_url() -> None:
+    queue_url = (
+        "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast-operations"
+    )
+
+    settings = Settings(
+        _env_file=None,
+        connector_fast_operations_enabled=True,
+        connector_fast_operation_queue_url=queue_url,
+    )
+
+    assert settings.connector_fast_operation_queue_url == queue_url
 
 
 def test_disabled_fast_operations_allow_missing_queue_url() -> None:

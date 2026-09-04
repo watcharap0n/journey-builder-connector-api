@@ -65,7 +65,7 @@ def _dispatch_payload(operation_type: str) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "operation_type", ["CONNECTION_TEST", "SCHEMA_DISCOVERY", "DATASET_PREVIEW"]
 )
-async def test_fast_operations_route_to_fifo_queue(
+async def test_fast_operations_route_to_standard_queue(
     monkeypatch: pytest.MonkeyPatch, operation_type: str
 ) -> None:
     client = _SqsClient()
@@ -77,7 +77,9 @@ async def test_fast_operations_route_to_fifo_queue(
         _env_file=None,
         connector_dispatch_queue_url="https://sqs.example/dispatch",
         connector_fast_operations_enabled=True,
-        connector_fast_operation_queue_url="https://sqs.example/fast.fifo",
+        connector_fast_operation_queue_url=(
+            "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast-operations"
+        ),
     )
     payload = _dispatch_payload(operation_type)
 
@@ -85,10 +87,10 @@ async def test_fast_operations_route_to_fifo_queue(
 
     assert client.messages == [
         {
-            "QueueUrl": "https://sqs.example/fast.fifo",
+            "QueueUrl": (
+                "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast-operations"
+            ),
             "MessageBody": json.dumps(payload, separators=(",", ":")),
-            "MessageGroupId": payload["connection_id"],
-            "MessageDeduplicationId": payload["operation_id"],
         }
     ]
 
@@ -130,7 +132,9 @@ async def test_non_fast_operations_stay_on_dispatch_queue(
         _env_file=None,
         connector_dispatch_queue_url="https://sqs.example/dispatch",
         connector_fast_operations_enabled=True,
-        connector_fast_operation_queue_url="https://sqs.example/fast.fifo",
+        connector_fast_operation_queue_url=(
+            "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast-operations"
+        ),
     )
 
     await _publish_dispatch(settings, _dispatch_payload(operation_type))

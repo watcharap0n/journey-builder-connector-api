@@ -1,8 +1,13 @@
+import re
 from functools import lru_cache
 from typing import Literal, Self
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+SQS_QUEUE_URL_PATTERN = re.compile(
+    r"https://sqs\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/\d{12}/[A-Za-z0-9_-]{1,80}"
+)
 
 
 class Settings(BaseSettings):
@@ -81,8 +86,12 @@ class Settings(BaseSettings):
                 "CONNECTOR_FAST_OPERATION_QUEUE_URL is required when "
                 "CONNECTOR_FAST_OPERATIONS_ENABLED is enabled"
             )
-        if not self.connector_fast_operation_queue_url.endswith(".fifo"):
-            raise ValueError("CONNECTOR_FAST_OPERATION_QUEUE_URL must be an SQS FIFO URL")
+        if self.connector_fast_operation_queue_url.endswith(".fifo"):
+            raise ValueError(
+                "CONNECTOR_FAST_OPERATION_QUEUE_URL must reference a standard SQS queue"
+            )
+        if not SQS_QUEUE_URL_PATTERN.fullmatch(self.connector_fast_operation_queue_url):
+            raise ValueError("CONNECTOR_FAST_OPERATION_QUEUE_URL must be a valid SQS URL")
         return self
 
     @field_validator("standardization_source_sslmode", mode="before")

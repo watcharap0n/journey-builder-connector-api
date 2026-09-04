@@ -125,15 +125,16 @@ The CDK output values map to `CONNECTOR_DISPATCH_QUEUE_URL`,
 `CONNECTOR_RESULT_QUEUE_URL`, `CONNECTOR_SCHEDULER_GROUP`, and
 `CONNECTOR_SCHEDULER_ROLE_ARN`. Set `CONNECTOR_FAST_OPERATIONS_ENABLED=true` and
 `CONNECTOR_FAST_OPERATION_QUEUE_URL` to route connection tests, schema discovery,
-and dataset previews to the fast FIFO queue. Dataset syncs continue to use
-`CONNECTOR_DISPATCH_QUEUE_URL`. Set `CONNECTOR_RUNTIME_WORKSPACE_ID` to limit the
-single-workspace POC runtime while retaining workspace-scoped metadata APIs. The
-connector worker polling interval defaults to one second and remains configurable
-with `CONNECTOR_WORKER_POLL_SECONDS`.
+and dataset previews to a standard (non-FIFO) fast SQS queue. FIFO queue URLs are
+rejected because fast-operation sends intentionally omit FIFO-only message
+attributes. Dataset syncs continue to use `CONNECTOR_DISPATCH_QUEUE_URL`. Set
+`CONNECTOR_RUNTIME_WORKSPACE_ID` to limit the single-workspace POC runtime while
+retaining workspace-scoped metadata APIs. The connector worker polling interval
+defaults to one second and remains configurable with `CONNECTOR_WORKER_POLL_SECONDS`.
 
 To roll back fast routing safely, first set
 `CONNECTOR_FAST_OPERATIONS_ENABLED=false` so new operations return to the normal
-dispatch queue. Keep the warm fast-queue consumer running until the FIFO queue is
+dispatch queue. Keep the warm fast-queue consumer running until the fast queue is
 drained before stopping it. The worker's atomic operation claim prevents duplicate
 execution while both consumers are running, and the API ignores legacy results for
 fast operations with an active worker lease. The lease guard is additional

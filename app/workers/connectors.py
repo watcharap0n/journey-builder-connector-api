@@ -110,11 +110,6 @@ async def _publish_dispatch(settings: Settings, payload: dict[str, Any]) -> None
         "QueueUrl": queue_url,
         "MessageBody": json.dumps(payload, separators=(",", ":")),
     }
-    if use_fast_queue:
-        message.update(
-            MessageGroupId=str(payload["connection_id"]),
-            MessageDeduplicationId=str(payload["operation_id"]),
-        )
     client = boto3.client("sqs", region_name=settings.aws_region)
     await asyncio.to_thread(client.send_message, **message)
 

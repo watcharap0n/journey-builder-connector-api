@@ -5,12 +5,14 @@ import hashlib
 import json
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -66,6 +68,26 @@ def _canonical_hash(value: Any) -> str:
 
 def _physical_source_code(workspace_id: uuid.UUID, source_code: str) -> str:
     return f"w{workspace_id.hex[:8]}_{source_code}"[:63]
+
+
+def _connection_constraint_conflict(exc: IntegrityError) -> str | None:
+    diagnostic = getattr(exc.orig, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    if constraint_name == "uq_connection_workspace_name":
+        return "connector name already exists in this workspace"
+    if constraint_name == "uq_connection_workspace_source":
+        return "connector source_code already exists in this workspace"
+    return None
+
+
+def _connection_identity_conflict(
+    existing: Sequence[ConnectorConnection], *, name: str, source_code: str
+) -> str | None:
+    if any(connection.name == name for connection in existing):
+        return "connector name already exists in this workspace"
+    if any(connection.source_code == source_code for connection in existing):
+        return "connector source_code already exists in this workspace"
+    return None
 
 
 def _validate_mapping_source_paths(
@@ -186,6 +208,23 @@ async def create_connection(
     payload: ConnectionCreate,
 ) -> ConnectorConnection:
     await get_workspace(session, workspace_id)
+    existing = (
+        await session.scalars(
+            select(ConnectorConnection).where(
+                ConnectorConnection.workspace_id == workspace_id,
+                or_(
+                    ConnectorConnection.name == payload.name,
+                    ConnectorConnection.source_code == payload.source_code,
+                ),
+            )
+        )
+    ).all()
+    identity_conflict = _connection_identity_conflict(
+        existing, name=payload.name, source_code=payload.source_code
+    )
+    if identity_conflict:
+        raise ConnectorConflictError(identity_conflict)
+
     connection = ConnectorConnection(
         workspace_id=workspace_id,
         definition_key=payload.engine,
@@ -196,9 +235,9 @@ async def create_connection(
         status="PROVISIONING",
     )
     session.add(connection)
-    await session.flush()
     created_secret_arn: str | None = None
     try:
+        await session.flush()
         secret_arn, created = await _put_secret(
             settings,
             workspace_id=workspace_id,
@@ -211,13 +250,17 @@ async def create_connection(
             created_secret_arn = secret_arn
         connection.status = "DRAFT"
         await session.commit()
-    except Exception:
+    except Exception as exc:
         await session.rollback()
         if created_secret_arn:
             try:
                 await _delete_secret(settings, created_secret_arn)
             except ClientError:
                 LOGGER.exception("failed to clean up connector secret after database rollback")
+        if isinstance(exc, IntegrityError):
+            conflict = _connection_constraint_conflict(exc)
+            if conflict:
+                raise ConnectorConflictError(conflict) from exc
         raise
     await session.refresh(connection)
     return connection

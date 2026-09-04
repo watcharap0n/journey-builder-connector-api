@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import CheckConstraint, DefaultClause, String, Table
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.dml import Update
 
 from app.core.config import Settings
@@ -27,6 +28,8 @@ from app.modules.connectors.schemas import (
 from app.modules.connectors.service import (
     ConnectorConfigurationError,
     ConnectorConflictError,
+    _connection_constraint_conflict,
+    _connection_identity_conflict,
     _physical_source_code,
     _validate_mapping_source_paths,
     queue_operation,
@@ -40,6 +43,66 @@ from app.workers.connectors import (
     _scheduler_start_bound,
     process_result_message,
 )
+
+
+def test_connection_identity_is_unique_only_within_workspace() -> None:
+    existing = [
+        cast(
+            ConnectorConnection,
+            SimpleNamespace(name="Primary PostgreSQL", source_code="primary_postgres"),
+        )
+    ]
+
+    assert (
+        _connection_identity_conflict(
+            existing,
+            name="Reporting PostgreSQL",
+            source_code="reporting_postgres",
+        )
+        is None
+    )
+    assert (
+        _connection_identity_conflict(
+            existing,
+            name="Primary PostgreSQL",
+            source_code="another_source",
+        )
+        == "connector name already exists in this workspace"
+    )
+    assert (
+        _connection_identity_conflict(
+            existing,
+            name="Another connector",
+            source_code="primary_postgres",
+        )
+        == "connector source_code already exists in this workspace"
+    )
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "message"),
+    [
+        (
+            "uq_connection_workspace_name",
+            "connector name already exists in this workspace",
+        ),
+        (
+            "uq_connection_workspace_source",
+            "connector source_code already exists in this workspace",
+        ),
+    ],
+)
+def test_connection_integrity_conflicts_are_translated(
+    constraint_name: str, message: str
+) -> None:
+    class ConstraintViolation(Exception):
+        def __init__(self) -> None:
+            self.diag = SimpleNamespace(constraint_name=constraint_name)
+
+    original = ConstraintViolation()
+    error = IntegrityError("insert", {}, original)
+
+    assert _connection_constraint_conflict(error) == message
 
 
 class _SqsClient:

@@ -79,6 +79,32 @@ def _scheduler_start_bound(
     return start if start > (now or datetime.now(UTC)) else None
 
 
+def _scheduler_control_request(
+    current: dict[str, Any],
+    *,
+    timezone: str,
+    state: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "ScheduleExpression": current["ScheduleExpression"],
+        "ScheduleExpressionTimezone": current.get("ScheduleExpressionTimezone", timezone),
+        "FlexibleTimeWindow": current["FlexibleTimeWindow"],
+        "Target": current["Target"],
+        "State": state,
+    }
+    start_date = current.get("StartDate")
+    if isinstance(start_date, datetime):
+        comparable_start = (
+            start_date if start_date.tzinfo is not None else start_date.replace(tzinfo=UTC)
+        )
+        if comparable_start > (now or datetime.now(UTC)):
+            request["StartDate"] = start_date
+    if current.get("EndDate"):
+        request["EndDate"] = current["EndDate"]
+    return request
+
+
 async def _queue_arn(settings: Settings, queue_url: str) -> str:
     client = boto3.client("sqs", region_name=settings.aws_region)
     response = await asyncio.to_thread(
@@ -154,13 +180,11 @@ async def _sync_aws_schedule(
             client.update_schedule,
             GroupName=settings.connector_scheduler_group,
             Name=schedule_name,
-            ScheduleExpression=current["ScheduleExpression"],
-            ScheduleExpressionTimezone=current.get("ScheduleExpressionTimezone", schedule.timezone),
-            FlexibleTimeWindow=current["FlexibleTimeWindow"],
-            Target=current["Target"],
-            State=desired_state,
-            **({"StartDate": current["StartDate"]} if current.get("StartDate") else {}),
-            **({"EndDate": current["EndDate"]} if current.get("EndDate") else {}),
+            **_scheduler_control_request(
+                current,
+                timezone=schedule.timezone,
+                state=desired_state,
+            ),
         )
         schedule.status = "PAUSED" if action == "pause" else "ACTIVE"
         return

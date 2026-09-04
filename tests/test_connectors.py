@@ -35,6 +35,7 @@ from app.workers.connectors import (
     _mark_operation_dispatched,
     _publish_dispatch,
     _scheduler_bound,
+    _scheduler_control_request,
     _scheduler_expression,
     _scheduler_start_bound,
     process_result_message,
@@ -770,6 +771,49 @@ def test_scheduler_start_bound_omits_elapsed_time() -> None:
         "Asia/Bangkok",
         now=datetime(2026, 9, 4, 3, 31, tzinfo=UTC),
     ) is None
+
+
+def test_scheduler_control_request_omits_elapsed_start_date() -> None:
+    current = {
+        "ScheduleExpression": "cron(30 10 * * ? *)",
+        "ScheduleExpressionTimezone": "Asia/Bangkok",
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {"Arn": "queue-arn", "RoleArn": "role-arn"},
+        "StartDate": datetime(2026, 9, 4, 3, 30, tzinfo=UTC),
+        "EndDate": datetime(2026, 12, 31, 16, 59, tzinfo=UTC),
+    }
+
+    request = _scheduler_control_request(
+        current,
+        timezone="Asia/Bangkok",
+        state="ENABLED",
+        now=datetime(2026, 9, 4, 4, 0, tzinfo=UTC),
+    )
+
+    assert "StartDate" not in request
+    assert request["EndDate"] == current["EndDate"]
+    assert request["State"] == "ENABLED"
+
+
+def test_scheduler_control_request_preserves_future_start_date() -> None:
+    start_date = datetime(2026, 9, 5, 3, 30, tzinfo=UTC)
+    current = {
+        "ScheduleExpression": "cron(30 10 * * ? *)",
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {"Arn": "queue-arn", "RoleArn": "role-arn"},
+        "StartDate": start_date,
+    }
+
+    request = _scheduler_control_request(
+        current,
+        timezone="Asia/Bangkok",
+        state="DISABLED",
+        now=datetime(2026, 9, 4, 4, 0, tzinfo=UTC),
+    )
+
+    assert request["StartDate"] == start_date
+    assert request["ScheduleExpressionTimezone"] == "Asia/Bangkok"
+    assert request["State"] == "DISABLED"
 
 
 def test_physical_source_code_is_workspace_scoped_and_bounded() -> None:

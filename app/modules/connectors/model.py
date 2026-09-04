@@ -217,6 +217,7 @@ class ConnectorOperation(Base, TimestampMixin):
             "'FAILED','SKIPPED','CANCELLED')",
             name="operation_status",
         ),
+        CheckConstraint("execution_attempt >= 0", name="execution_attempt"),
         Index("ix_operation_workspace_created", "workspace_id", "created_at"),
         {"schema": "connector"},
     )
@@ -242,6 +243,11 @@ class ConnectorOperation(Base, TimestampMixin):
     request_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     result_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(100))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ScheduleOccurrence(Base):

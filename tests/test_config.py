@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.infrastructure.secrets import aws as database_secrets
@@ -73,8 +74,7 @@ def test_local_secret_manager_host_maps_to_forwarded_loopback(
 
     monkeypatch.setattr(database_secrets, "_is_container_runtime", lambda: False)
     monkeypatch.setattr(
-        database_secrets.boto3,
-        "client",
+        "app.infrastructure.secrets.aws.boto3.client",
         lambda *_args, **_kwargs: _SecretsManagerClient(),
     )
     settings = Settings(
@@ -104,3 +104,36 @@ def test_legacy_standardization_ssl_boolean_maps_to_sslmode(
     )
 
     assert settings.standardization_source_sslmode == expected
+
+
+def test_connector_fast_operation_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.connector_fast_operations_enabled is False
+    assert settings.connector_fast_operation_queue_url is None
+    assert settings.connector_worker_poll_seconds == 1
+    configured = Settings(_env_file=None, connector_worker_poll_seconds=7)
+    assert configured.connector_worker_poll_seconds == 7
+
+
+@pytest.mark.parametrize(
+    "queue_url",
+    [None, "https://sqs.ap-southeast-1.amazonaws.com/123456789012/fast-operations"],
+)
+def test_enabled_fast_operations_require_fifo_queue_url(queue_url: str | None) -> None:
+    with pytest.raises(ValidationError, match="CONNECTOR_FAST_OPERATION_QUEUE_URL"):
+        Settings(
+            _env_file=None,
+            connector_fast_operations_enabled=True,
+            connector_fast_operation_queue_url=queue_url,
+        )
+
+
+def test_disabled_fast_operations_allow_missing_queue_url() -> None:
+    settings = Settings(
+        _env_file=None,
+        connector_fast_operations_enabled=False,
+        connector_fast_operation_queue_url=None,
+    )
+
+    assert settings.connector_fast_operation_queue_url is None

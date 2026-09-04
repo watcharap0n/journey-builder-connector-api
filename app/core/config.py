@@ -1,7 +1,7 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,13 +44,15 @@ class Settings(BaseSettings):
     connector_secret_prefix: str = "connector"
     connector_secret_kms_key_id: str | None = None
     connector_dispatch_queue_url: str | None = None
+    connector_fast_operations_enabled: bool = False
+    connector_fast_operation_queue_url: str | None = None
     connector_occurrence_queue_url: str | None = None
     connector_occurrence_dlq_arn: str | None = None
     connector_result_queue_url: str | None = None
     connector_scheduler_group: str | None = None
     connector_scheduler_role_arn: str | None = None
     connector_runtime_workspace_id: str | None = None
-    connector_worker_poll_seconds: int = Field(default=10, ge=1, le=300)
+    connector_worker_poll_seconds: int = Field(default=1, ge=1, le=300)
 
     standardization_source_secret_id: str | None = None
     standardization_source_database: str = "elasticsearch"
@@ -69,6 +71,19 @@ class Settings(BaseSettings):
     standardization_stale_partition_seconds: int = Field(
         default=900, ge=120, le=86400
     )
+
+    @model_validator(mode="after")
+    def validate_connector_fast_operation_queue(self) -> Self:
+        if not self.connector_fast_operations_enabled:
+            return self
+        if not self.connector_fast_operation_queue_url:
+            raise ValueError(
+                "CONNECTOR_FAST_OPERATION_QUEUE_URL is required when "
+                "CONNECTOR_FAST_OPERATIONS_ENABLED is enabled"
+            )
+        if not self.connector_fast_operation_queue_url.endswith(".fifo"):
+            raise ValueError("CONNECTOR_FAST_OPERATION_QUEUE_URL must be an SQS FIFO URL")
+        return self
 
     @field_validator("standardization_source_sslmode", mode="before")
     @classmethod

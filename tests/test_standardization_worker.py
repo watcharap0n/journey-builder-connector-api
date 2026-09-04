@@ -210,8 +210,9 @@ async def test_reconciler_finalizes_complete_checkpoint_without_result_message()
         ]
     )
 
-    reconciled = await reconcile_partition_once(  # type: ignore[arg-type]
-        _SessionFactory(session), 900
+    reconciled = await reconcile_partition_once(
+        _SessionFactory(session),  # type: ignore[arg-type]
+        900,
     )
 
     run_update = next(
@@ -250,8 +251,9 @@ async def test_reconciler_requeues_stale_running_checkpoint() -> None:
         ]
     )
 
-    reconciled = await reconcile_partition_once(  # type: ignore[arg-type]
-        _SessionFactory(session), 900
+    reconciled = await reconcile_partition_once(
+        _SessionFactory(session),  # type: ignore[arg-type]
+        900,
     )
 
     retry_insert = next(

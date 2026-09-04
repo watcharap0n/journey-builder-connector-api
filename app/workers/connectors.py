@@ -27,6 +27,10 @@ from app.modules.connectors.model import (
 from app.modules.connectors.service import ActiveSyncRunError, materialize_sync_run
 
 LOGGER = logging.getLogger(__name__)
+FAST_OPERATION_TYPES = frozenset(
+    {"CONNECTION_TEST", "SCHEMA_DISCOVERY", "DATASET_PREVIEW"}
+)
+PREVIEW_CLEANUP_INTERVAL_SECONDS = 60.0
 
 
 async def cleanup_expired_preview_results(session: AsyncSession) -> None:
@@ -84,13 +88,47 @@ async def _queue_arn(settings: Settings, queue_url: str) -> str:
 
 
 async def _publish_dispatch(settings: Settings, payload: dict[str, Any]) -> None:
-    if not settings.connector_dispatch_queue_url:
+    operation_type = payload.get("operation_type")
+    use_fast_queue = (
+        settings.connector_fast_operations_enabled
+        and operation_type in FAST_OPERATION_TYPES
+    )
+    if use_fast_queue and not settings.connector_fast_operation_queue_url:
+        raise RuntimeError(
+            "CONNECTOR_FAST_OPERATION_QUEUE_URL is required when "
+            "CONNECTOR_FAST_OPERATIONS_ENABLED is enabled"
+        )
+    if not use_fast_queue and not settings.connector_dispatch_queue_url:
         raise RuntimeError("CONNECTOR_DISPATCH_QUEUE_URL is not configured")
+
+    queue_url = (
+        settings.connector_fast_operation_queue_url
+        if use_fast_queue
+        else settings.connector_dispatch_queue_url
+    )
+    message: dict[str, Any] = {
+        "QueueUrl": queue_url,
+        "MessageBody": json.dumps(payload, separators=(",", ":")),
+    }
+    if use_fast_queue:
+        message.update(
+            MessageGroupId=str(payload["connection_id"]),
+            MessageDeduplicationId=str(payload["operation_id"]),
+        )
     client = boto3.client("sqs", region_name=settings.aws_region)
-    await asyncio.to_thread(
-        client.send_message,
-        QueueUrl=settings.connector_dispatch_queue_url,
-        MessageBody=json.dumps(payload, separators=(",", ":")),
+    await asyncio.to_thread(client.send_message, **message)
+
+
+async def _mark_operation_dispatched(
+    session: AsyncSession, operation_id: uuid.UUID
+) -> None:
+    await session.execute(
+        update(ConnectorOperation)
+        .where(
+            ConnectorOperation.operation_id == operation_id,
+            ConnectorOperation.status == "QUEUED",
+        )
+        .values(status="DISPATCHED")
     )
 
 
@@ -195,8 +233,6 @@ async def process_outbox_once(
     session_factory: async_sessionmaker[AsyncSession], settings: Settings
 ) -> bool:
     async with session_factory() as session:
-        await cleanup_expired_preview_results(session)
-        await session.commit()
         async with session.begin():
             event = await session.scalar(
                 select(OutboxEvent)
@@ -216,11 +252,9 @@ async def process_outbox_once(
         try:
             if event.event_type == "operation.dispatch":
                 await _publish_dispatch(settings, event.payload_json)
-                operation = await session.get(
-                    ConnectorOperation, uuid.UUID(event.payload_json["operation_id"])
+                await _mark_operation_dispatched(
+                    session, uuid.UUID(event.payload_json["operation_id"])
                 )
-                if operation is not None and operation.status == "QUEUED":
-                    operation.status = "DISPATCHED"
             elif event.event_type.startswith("schedule."):
                 await _sync_aws_schedule(session, settings, event)
             else:
@@ -291,10 +325,25 @@ async def process_result_message(
     if terminal_status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
         raise ValueError("result message status must be terminal")
     async with session_factory() as session:
-        operation = await session.get(ConnectorOperation, operation_id)
+        operation = await session.scalar(
+            select(ConnectorOperation)
+            .where(ConnectorOperation.operation_id == operation_id)
+            .with_for_update()
+        )
         if operation is None:
             raise RuntimeError("operation not found")
         if operation.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            return
+        if (
+            operation.operation_type in FAST_OPERATION_TYPES
+            and operation.lease_owner is not None
+            and operation.lease_expires_at is not None
+            and operation.lease_expires_at > datetime.now(UTC)
+        ):
+            LOGGER.info(
+                "ignoring legacy result for fast-leased connector operation id=%s",
+                operation_id,
+            )
             return
         operation.status = terminal_status
         operation.completed_at = datetime.now(UTC)
@@ -342,7 +391,14 @@ async def run_worker(mode: str) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         if mode == "outbox":
+            next_preview_cleanup_at = 0.0
             while True:
+                now = asyncio.get_running_loop().time()
+                if now >= next_preview_cleanup_at:
+                    async with session_factory() as session:
+                        await cleanup_expired_preview_results(session)
+                        await session.commit()
+                    next_preview_cleanup_at = now + PREVIEW_CLEANUP_INTERVAL_SECONDS
                 processed = await process_outbox_once(session_factory, settings)
                 if not processed:
                     await asyncio.sleep(settings.connector_worker_poll_seconds)

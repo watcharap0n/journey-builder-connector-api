@@ -349,6 +349,7 @@ class OperationView(ViewModel):
     error_message: str | None
     result_json: dict[str, Any]
     result_expires_at: datetime | None
+    execution_attempt: int = Field(default=0, ge=0)
     created_at: datetime
     updated_at: datetime
 

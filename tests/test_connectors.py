@@ -1,12 +1,16 @@
+import json
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
+from sqlalchemy import CheckConstraint, DefaultClause, String, Table
+from sqlalchemy.sql.dml import Update
 
+from app.core.config import Settings
 from app.main import create_app
 from app.modules.connectors import controller
 from app.modules.connectors.controller import _hide_expired_preview_result
@@ -28,10 +32,270 @@ from app.modules.connectors.service import (
     queue_operation,
 )
 from app.workers.connectors import (
+    _mark_operation_dispatched,
+    _publish_dispatch,
     _scheduler_bound,
     _scheduler_expression,
     _scheduler_start_bound,
+    process_result_message,
 )
+
+
+class _SqsClient:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    def send_message(self, **message: Any) -> None:
+        self.messages.append(message)
+
+
+def _dispatch_payload(operation_type: str) -> dict[str, Any]:
+    return {
+        "message_version": 1,
+        "operation_id": "00000000-0000-4000-8000-000000000001",
+        "operation_type": operation_type,
+        "workspace_id": "00000000-0000-4000-8000-000000000002",
+        "connection_id": "00000000-0000-4000-8000-000000000003",
+        "dataset_id": None,
+        "revision": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation_type", ["CONNECTION_TEST", "SCHEMA_DISCOVERY", "DATASET_PREVIEW"]
+)
+async def test_fast_operations_route_to_fifo_queue(
+    monkeypatch: pytest.MonkeyPatch, operation_type: str
+) -> None:
+    client = _SqsClient()
+    monkeypatch.setattr(
+        "app.workers.connectors.boto3.client",
+        lambda *_args, **_kwargs: client,
+    )
+    settings = Settings(
+        _env_file=None,
+        connector_dispatch_queue_url="https://sqs.example/dispatch",
+        connector_fast_operations_enabled=True,
+        connector_fast_operation_queue_url="https://sqs.example/fast.fifo",
+    )
+    payload = _dispatch_payload(operation_type)
+
+    await _publish_dispatch(settings, payload)
+
+    assert client.messages == [
+        {
+            "QueueUrl": "https://sqs.example/fast.fifo",
+            "MessageBody": json.dumps(payload, separators=(",", ":")),
+            "MessageGroupId": payload["connection_id"],
+            "MessageDeduplicationId": payload["operation_id"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fast_operation_routing_falls_back_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _SqsClient()
+    monkeypatch.setattr(
+        "app.workers.connectors.boto3.client",
+        lambda *_args, **_kwargs: client,
+    )
+    settings = Settings(
+        _env_file=None,
+        connector_dispatch_queue_url="https://sqs.example/dispatch",
+        connector_fast_operations_enabled=False,
+        connector_fast_operation_queue_url="https://sqs.example/fast.fifo",
+    )
+
+    await _publish_dispatch(settings, _dispatch_payload("CONNECTION_TEST"))
+
+    assert client.messages[0]["QueueUrl"] == "https://sqs.example/dispatch"
+    assert "MessageGroupId" not in client.messages[0]
+    assert "MessageDeduplicationId" not in client.messages[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation_type", ["DATASET_SYNC", "FUTURE_OPERATION"])
+async def test_non_fast_operations_stay_on_dispatch_queue(
+    monkeypatch: pytest.MonkeyPatch, operation_type: str
+) -> None:
+    client = _SqsClient()
+    monkeypatch.setattr(
+        "app.workers.connectors.boto3.client",
+        lambda *_args, **_kwargs: client,
+    )
+    settings = Settings(
+        _env_file=None,
+        connector_dispatch_queue_url="https://sqs.example/dispatch",
+        connector_fast_operations_enabled=True,
+        connector_fast_operation_queue_url="https://sqs.example/fast.fifo",
+    )
+
+    await _publish_dispatch(settings, _dispatch_payload(operation_type))
+
+    assert client.messages[0]["QueueUrl"] == "https://sqs.example/dispatch"
+    assert "MessageGroupId" not in client.messages[0]
+    assert "MessageDeduplicationId" not in client.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_mark_dispatched_does_not_overwrite_running_operation() -> None:
+    operation_id = uuid.UUID("00000000-0000-4000-8000-000000000001")
+
+    class Session:
+        def __init__(self) -> None:
+            self.statement: Update | None = None
+
+        async def execute(self, statement: Update) -> None:
+            self.statement = statement
+
+    session = Session()
+    await _mark_operation_dispatched(
+        session,  # type: ignore[arg-type]
+        operation_id,
+    )
+
+    assert session.statement is not None
+    sql = str(
+        session.statement.compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "SET status='DISPATCHED'" in sql
+    assert operation_id.hex in sql
+    assert "operation.status = 'QUEUED'" in sql
+
+
+class _ConnectorResultSession:
+    def __init__(self, operation: SimpleNamespace, run: SimpleNamespace | None = None) -> None:
+        self.responses = [operation, run]
+        self.statements: list[object] = []
+        self.commits = 0
+
+    async def __aenter__(self) -> "_ConnectorResultSession":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def scalar(self, statement: object) -> Any:
+        self.statements.append(statement)
+        return self.responses.pop(0)
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class _ConnectorResultSessionFactory:
+    def __init__(self, session: _ConnectorResultSession) -> None:
+        self.session = session
+
+    def __call__(self) -> _ConnectorResultSession:
+        return self.session
+
+
+def _pending_result_operation(
+    *,
+    operation_type: str = "CONNECTION_TEST",
+    lease_owner: str | None,
+    lease_expires_at: datetime | None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        status="RUNNING",
+        operation_type=operation_type,
+        lease_owner=lease_owner,
+        lease_expires_at=lease_expires_at,
+        completed_at=None,
+        error_code=None,
+        error_message=None,
+        result_json={},
+    )
+
+
+def _legacy_result_payload(status: str) -> dict[str, Any]:
+    return {
+        "operation_id": "00000000-0000-4000-8000-000000000001",
+        "status": status,
+        "error_code": "LEGACY_ERROR" if status == "FAILED" else None,
+        "error_message": "legacy result" if status == "FAILED" else None,
+        "metrics": {"transport": "legacy"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["FAILED", "SUCCEEDED"])
+async def test_active_fast_lease_ignores_legacy_result(terminal_status: str) -> None:
+    operation = _pending_result_operation(
+        lease_owner="fast-worker-1",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    session = _ConnectorResultSession(operation)
+
+    await process_result_message(
+        _ConnectorResultSessionFactory(session),  # type: ignore[arg-type]
+        _legacy_result_payload(terminal_status),
+    )
+
+    assert operation.status == "RUNNING"
+    assert operation.completed_at is None
+    assert operation.result_json == {}
+    assert len(session.statements) == 1
+    assert "FOR UPDATE" in str(session.statements[0])
+    assert session.commits == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lease_owner", "lease_expires_at", "terminal_status"),
+    [
+        ("fast-worker-1", datetime.now(UTC) - timedelta(minutes=1), "FAILED"),
+        (None, datetime.now(UTC) + timedelta(minutes=1), "SUCCEEDED"),
+    ],
+)
+async def test_expired_or_missing_fast_lease_processes_legacy_result(
+    lease_owner: str | None,
+    lease_expires_at: datetime | None,
+    terminal_status: str,
+) -> None:
+    operation = _pending_result_operation(
+        lease_owner=lease_owner,
+        lease_expires_at=lease_expires_at,
+    )
+    session = _ConnectorResultSession(operation)
+
+    await process_result_message(
+        _ConnectorResultSessionFactory(session),  # type: ignore[arg-type]
+        _legacy_result_payload(terminal_status),
+    )
+
+    assert operation.status == terminal_status
+    assert operation.completed_at is not None
+    assert operation.result_json == {"transport": "legacy"}
+    assert len(session.statements) == 2
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_dataset_sync_processes_legacy_result_despite_active_lease() -> None:
+    operation = _pending_result_operation(
+        operation_type="DATASET_SYNC",
+        lease_owner="unexpected-owner",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    run = SimpleNamespace(status="RUNNING", completed_at=None)
+    session = _ConnectorResultSession(operation, run)
+
+    await process_result_message(
+        _ConnectorResultSessionFactory(session),  # type: ignore[arg-type]
+        _legacy_result_payload("SUCCEEDED"),
+    )
+
+    assert operation.status == "SUCCEEDED"
+    assert run.status == "SUCCEEDED"
+    assert run.completed_at == operation.completed_at
+    assert session.commits == 1
 
 
 def test_credentials_are_write_only_in_connection_contract() -> None:
@@ -344,7 +608,7 @@ async def test_preview_queues_workspace_scoped_idempotent_operation(
     accepted = await controller.post_dataset_preview(
         workspace_id,
         dataset_id,
-        controller.DatasetPreviewRequest(),
+        DatasetPreviewRequest(),
         object(),  # type: ignore[arg-type]
         "preview-key",
     )
@@ -376,7 +640,7 @@ async def test_preview_rejects_dataset_from_another_workspace(
         await controller.post_dataset_preview(
             uuid.uuid4(),
             uuid.uuid4(),
-            controller.DatasetPreviewRequest(),
+            DatasetPreviewRequest(),
             object(),  # type: ignore[arg-type]
             None,
         )
@@ -440,7 +704,7 @@ async def test_preview_idempotency_key_cannot_change_limit() -> None:
             return self.responses.pop(0)
 
     with pytest.raises(ConnectorConflictError, match="another operation"):
-        await queue_operation(  # type: ignore[arg-type]
+        await queue_operation(
             Session(),  # type: ignore[arg-type]
             workspace_id=workspace_id,
             connection_id=connection_id,
@@ -512,9 +776,10 @@ def test_physical_source_code_is_workspace_scoped_and_bounded() -> None:
 
 
 def test_active_sync_index_is_partial_and_unique() -> None:
+    table = cast(Table, SyncRun.__table__)
     index = next(
         index
-        for index in SyncRun.__table__.indexes
+        for index in table.indexes
         if index.name == "uq_sync_run_active_dataset"
     )
     assert index.unique is True
@@ -522,15 +787,37 @@ def test_active_sync_index_is_partial_and_unique() -> None:
 
 
 def test_operation_type_constraint_allows_dataset_preview() -> None:
-    constraint = next(
-        constraint
-        for constraint in ConnectorOperation.__table__.constraints
-        if "operation_type IN" in str(getattr(constraint, "sqltext", ""))
+    table = cast(Table, ConnectorOperation.__table__)
+    constraint = cast(
+        CheckConstraint,
+        next(
+            constraint
+            for constraint in table.constraints
+            if "operation_type IN" in str(getattr(constraint, "sqltext", ""))
+        ),
     )
     assert "DATASET_PREVIEW" in str(constraint.sqltext)
 
 
-def test_openapi_exposes_workspace_scoped_connector_routes(settings) -> None:
+def test_operation_execution_lease_columns_match_contract() -> None:
+    table = cast(Table, ConnectorOperation.__table__)
+    execution_attempt = table.columns["execution_attempt"]
+    lease_owner_type = cast(String, table.columns["lease_owner"].type)
+
+    assert execution_attempt.nullable is False
+    assert execution_attempt.server_default is not None
+    server_default = cast(DefaultClause, execution_attempt.server_default)
+    assert str(server_default.arg) == "0"
+    assert lease_owner_type.length == 100
+    assert table.columns["lease_owner"].nullable is True
+    assert table.columns["lease_expires_at"].nullable is True
+    assert any(
+        "execution_attempt >= 0" in str(getattr(constraint, "sqltext", ""))
+        for constraint in table.constraints
+    )
+
+
+def test_openapi_exposes_workspace_scoped_connector_routes(settings: Settings) -> None:
     paths = create_app(settings).openapi()["paths"]
     assert "/api/v1/workspaces/{workspace_id}/connectors" in paths
     assert (

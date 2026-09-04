@@ -1,10 +1,14 @@
+from typing import Any
+
+import pytest
+
+from app.core.config import Settings
 from app.main import create_app
-from app.modules.standardization import service as standardization_service
 from app.modules.standardization.schemas import SourcePartitionInventory
 from app.modules.standardization.service import INVENTORY_SQL, discover_source_inventory
 
 
-def test_openapi_exposes_manual_standardization_routes(settings) -> None:
+def test_openapi_exposes_manual_standardization_routes(settings: Settings) -> None:
     paths = create_app(settings).openapi()["paths"]
     assert (
         "/api/v1/workspaces/{workspace_id}/standardization-datasets/{dataset_id}/runs"
@@ -31,7 +35,7 @@ def test_inventory_tracks_both_baseline_and_incremental_cutoffs() -> None:
 
 
 async def test_inventory_connection_uses_configured_sslmode(
-    monkeypatch, settings
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -52,16 +56,15 @@ async def test_inventory_connection_uses_configured_sslmode(
         async def close(self) -> None:
             return None
 
-    async def _connect(**kwargs):
+    async def _connect(**kwargs: Any) -> _Connection:
         captured.update(kwargs)
         return _Connection()
 
     monkeypatch.setattr(
-        standardization_service.boto3,
-        "client",
+        "app.modules.standardization.service.boto3.client",
         lambda *_args, **_kwargs: _SecretsManagerClient(),
     )
-    monkeypatch.setattr(standardization_service.asyncpg, "connect", _connect)
+    monkeypatch.setattr("app.modules.standardization.service.asyncpg.connect", _connect)
     configured = settings.model_copy(
         update={
             "standardization_source_secret_id": "source-secret",

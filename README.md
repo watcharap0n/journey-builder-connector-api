@@ -213,6 +213,15 @@ docker compose run --rm api alembic upgrade head
 
 ## Adding a feature
 
+To assign a legacy connector workspace's missing app before its first sync, call
+`PATCH /api/v1/workspaces/{workspace_id}` with `{"app_id":"00042"}`. The value
+is a literal decimal string (leading zeros are retained). The response is the
+updated workspace. Unknown workspaces return 404, invalid payloads return 422,
+and assigning an app after any connector sync run returns 409. An existing
+non-null app ID cannot be rebound, even before a run (database guard); repeating
+the same app ID is idempotent. This endpoint does not register connector engines
+or repair failed connector creation.
+
 1. Create `app/modules/<feature>/` with controller, service, repository, model,
    and schemas as needed.
 2. Extend `BaseRepository` only for shared CRUD; keep feature queries in that

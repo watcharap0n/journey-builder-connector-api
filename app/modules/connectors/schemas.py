@@ -52,12 +52,20 @@ class ViewModel(BaseModel):
 class WorkspaceCreate(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")
     name: str = Field(min_length=1, max_length=255)
+    # Literal decimal app component from upload batch_ref; never cast to int.
+    app_id: str = Field(pattern=r"^[0-9]+$", strict=True, min_length=1, max_length=97)
 
+
+class WorkspaceAppUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: str = Field(pattern=r"^[0-9]+$", strict=True, min_length=1, max_length=97)
 
 class WorkspaceView(ViewModel):
     workspace_id: uuid.UUID
     slug: str
     name: str
+    app_id: str | None
     is_active: bool
     created_at: datetime
     updated_at: datetime

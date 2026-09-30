@@ -28,6 +28,7 @@ from app.modules.connectors.schemas import (
     ScheduleView,
     SchemaSnapshotView,
     SyncRunView,
+    WorkspaceAppUpdate,
     WorkspaceCreate,
     WorkspaceView,
 )
@@ -46,6 +47,7 @@ from app.modules.connectors.service import (
     update_connection,
     update_credentials,
     update_dataset,
+    update_workspace_app,
     upsert_schedule,
 )
 
@@ -79,7 +81,10 @@ def _translate_error(exc: Exception) -> HTTPException:
 async def post_workspace(
     payload: WorkspaceCreate, session: SessionDep
 ) -> WorkspaceView:
-    return WorkspaceView.model_validate(await create_workspace(session, payload))
+    try:
+        return WorkspaceView.model_validate(await create_workspace(session, payload))
+    except ConnectorConflictError as exc:
+        raise _translate_error(exc) from exc
 
 
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceView)
@@ -88,6 +93,18 @@ async def get_workspace_by_id(
 ) -> WorkspaceView:
     try:
         return WorkspaceView.model_validate(await get_workspace(session, workspace_id))
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.patch("/workspaces/{workspace_id}", response_model=WorkspaceView)
+async def patch_workspace_app(
+    workspace_id: uuid.UUID, payload: WorkspaceAppUpdate, session: SessionDep
+) -> WorkspaceView:
+    try:
+        return WorkspaceView.model_validate(
+            await update_workspace_app(session, workspace_id, payload)
+        )
     except Exception as exc:
         raise _translate_error(exc) from exc
 

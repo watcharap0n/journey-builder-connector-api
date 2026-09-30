@@ -28,12 +28,17 @@ class Workspace(Base, TimestampMixin):
     __tablename__ = "workspace"
     __table_args__ = (
         UniqueConstraint("slug", name="uq_workspace_slug"),
+        CheckConstraint(
+            "app_id IS NULL OR (app_id ~ '^[0-9]+$' AND length(app_id) <= 97)",
+            name="workspace_app_id_decimal",
+        ),
         {"schema": "platform"},
     )
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     slug: Mapped[str] = mapped_column(String(63), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    app_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 

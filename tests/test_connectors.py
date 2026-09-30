@@ -879,11 +879,13 @@ def test_scheduler_control_request_preserves_future_start_date() -> None:
     assert request["State"] == "DISABLED"
 
 
-def test_physical_source_code_is_workspace_scoped_and_bounded() -> None:
-    workspace_id = uuid.UUID("00000000-0000-4000-8000-000000000001")
-    result = _physical_source_code(workspace_id, "a" * 63)
-    assert result.startswith("w00000000_")
-    assert len(result) == 63
+def test_physical_source_code_is_connection_scoped_and_fits_source_column() -> None:
+    connection_id = uuid.UUID("00000000-0000-4000-8000-000000000001")
+    result = _physical_source_code(connection_id)
+    assert result == f"dc1-{connection_id.hex}"
+    assert len(result) <= 50
+    collision_prefix = uuid.UUID("00000000-1111-4000-8000-000000000002")
+    assert _physical_source_code(collision_prefix) != result
 
 
 def test_active_sync_index_is_partial_and_unique() -> None:

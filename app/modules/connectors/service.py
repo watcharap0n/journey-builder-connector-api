@@ -35,6 +35,7 @@ from app.modules.connectors.schemas import (
     DatasetUpdate,
     MappingCreate,
     ScheduleUpsert,
+    WorkspaceAppUpdate,
     WorkspaceCreate,
 )
 
@@ -66,8 +67,25 @@ def _canonical_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _physical_source_code(workspace_id: uuid.UUID, source_code: str) -> str:
-    return f"w{workspace_id.hex[:8]}_{source_code}"[:63]
+def _physical_source_code(connection_id: uuid.UUID) -> str:
+    # A physical source is the existing globally keyed raw identity namespace.
+    # Full UUIDs prevent unrelated workspaces/apps sharing a source ID.
+    return f"dc1-{connection_id.hex}"
+
+
+def _workspace_slug_conflict(exc: IntegrityError) -> bool:
+    # asyncpg wraps its UniqueViolationError in the SQLAlchemy DBAPI adapter.
+    original = exc.orig
+    cause = getattr(original, "__cause__", None)
+    for error in (original, cause):
+        if error is None:
+            continue
+        constraint = getattr(getattr(error, "diag", None), "constraint_name", None)
+        constraint = constraint or getattr(error, "constraint_name", None)
+        sqlstate = getattr(error, "sqlstate", None) or getattr(error, "pgcode", None)
+        if sqlstate == "23505" and constraint in {"workspace_slug_key", "uq_workspace_slug"}:
+            return True
+    return False
 
 
 def _connection_constraint_conflict(exc: IntegrityError) -> str | None:
@@ -136,9 +154,15 @@ def _outbox(
 
 
 async def create_workspace(session: AsyncSession, payload: WorkspaceCreate) -> Workspace:
-    workspace = Workspace(slug=payload.slug, name=payload.name)
+    workspace = Workspace(slug=payload.slug, name=payload.name, app_id=payload.app_id)
     session.add(workspace)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        if _workspace_slug_conflict(exc):
+            raise ConnectorConflictError("workspace slug already exists") from exc
+        raise
     await session.refresh(workspace)
     return workspace
 
@@ -147,6 +171,29 @@ async def get_workspace(session: AsyncSession, workspace_id: uuid.UUID) -> Works
     workspace = await ConnectorRepository(session).get_workspace(workspace_id)
     if workspace is None:
         raise ConnectorNotFoundError("workspace not found")
+    return workspace
+
+
+async def update_workspace_app(
+    session: AsyncSession, workspace_id: uuid.UUID, payload: WorkspaceAppUpdate
+) -> Workspace:
+    workspace = await session.get(Workspace, workspace_id, with_for_update=True)
+    if workspace is None:
+        raise ConnectorNotFoundError("workspace not found")
+    if workspace.app_id != payload.app_id:
+        if workspace.app_id is not None:
+            raise ConnectorConflictError("workspace app_id cannot be rebound")
+        previous_run = await session.execute(
+            select(SyncRun.sync_run_id)
+            .join(ConnectorDataset, ConnectorDataset.dataset_id == SyncRun.dataset_id)
+            .where(ConnectorDataset.workspace_id == workspace_id)
+            .limit(1)
+        )
+        if previous_run.scalar_one_or_none() is not None:
+            raise ConnectorConflictError("workspace app_id cannot change after connector sync")
+        workspace.app_id = payload.app_id
+    await session.commit()
+    await session.refresh(workspace)
     return workspace
 
 
@@ -566,6 +613,11 @@ async def materialize_sync_run(
         raise ConnectorNotFoundError("dataset not found")
     if dataset.active_mapping_version_id is None:
         raise ConnectorConfigurationError("dataset has no published mapping")
+    workspace = await session.get(Workspace, workspace_id, with_for_update=True)
+    if workspace is None:
+        raise ConnectorNotFoundError("workspace not found")
+    if not workspace.app_id:
+        raise ConnectorConfigurationError("workspace app_id is required before connector sync")
     connection = await repository.get_connection(workspace_id, dataset.connection_id)
     if connection is None or connection.status != "READY":
         raise ConnectorConflictError("connector must be READY before sync")
@@ -593,20 +645,36 @@ async def materialize_sync_run(
     if active:
         raise ActiveSyncRunError("dataset already has an active sync run")
 
-    physical_code = _physical_source_code(workspace_id, connection.source_code)
+    physical_code = _physical_source_code(connection.connection_id)
     if connection.source_system_id is None:
         result = await session.execute(
             text(
                 """
                 INSERT INTO control.source_system (source_code, source_name, source_type, is_active)
                 VALUES (:source_code, :source_name, 'database_connector', true)
-                ON CONFLICT (source_code) DO UPDATE SET is_active = true
+                ON CONFLICT (source_code) DO NOTHING
                 RETURNING source_system_id
                 """
             ),
             {"source_code": physical_code, "source_name": connection.name},
         )
-        connection.source_system_id = int(result.scalar_one())
+        registered = result.scalar_one_or_none()
+        if registered is None:
+            raise ConnectorConflictError("connector physical source code is already registered")
+        connection.source_system_id = int(registered)
+    else:
+        result = await session.execute(
+            text(
+                """
+                SELECT source_system_id FROM control.source_system
+                WHERE source_system_id = :source_system_id AND source_code = :source_code
+                  AND source_type = 'database_connector'
+                """
+            ),
+            {"source_system_id": connection.source_system_id, "source_code": physical_code},
+        )
+        if result.scalar_one_or_none() != connection.source_system_id:
+            raise ConnectorConflictError("connector source registration does not match connection")
 
     operation = ConnectorOperation(
         workspace_id=workspace_id,
@@ -695,6 +763,21 @@ async def materialize_sync_run(
     )
     session.add(run)
     await session.flush()
+    # The SQL entrypoint checks the persisted sync_run and workspace; no
+    # application-supplied app value can overwrite another workspace's batch.
+    bound = await session.execute(
+        text(
+            "SELECT control.bind_connector_batch_app_id("
+            ":ingestion_batch_id, :workspace_id, :app_id)"
+        ),
+        {
+            "ingestion_batch_id": ingestion_batch_id,
+            "workspace_id": workspace_id,
+            "app_id": workspace.app_id,
+        },
+    )
+    if bound.scalar_one() != workspace.app_id:
+        raise ConnectorConfigurationError("connector batch app_id binding failed")
     session.add(
         _outbox(
             workspace_id=workspace_id,

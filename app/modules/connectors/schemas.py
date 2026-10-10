@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-ConnectorEngine = Literal["postgresql", "mysql", "mariadb", "mongodb"]
+ConnectorEngine = Literal["postgresql", "mysql", "mariadb", "mongodb", "azure_sql"]
 CUSTOMER_TARGET_FIELDS = {
     "source_customer_id",
     "external_id",
@@ -60,6 +60,7 @@ class WorkspaceAppUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     app_id: str = Field(pattern=r"^[0-9]+$", strict=True, min_length=1, max_length=97)
+
 
 class WorkspaceView(ViewModel):
     workspace_id: uuid.UUID
@@ -156,6 +157,17 @@ class ConnectionCreate(BaseModel):
     endpoint_label: str | None = Field(default=None, max_length=255)
     safe_config: dict[str, Any] = Field(default_factory=dict)
     credentials: SourceCredentials
+
+    @model_validator(mode="after")
+    def validate_azure_sql(self) -> ConnectionCreate:
+        if self.engine == "azure_sql":
+            credentials = self.credentials
+            if credentials.tunnel or credentials.uri or credentials.hosts:
+                raise ValueError("Azure SQL requires a direct host connection")
+            if not all((credentials.host, credentials.database, credentials.username,
+                        credentials.password)):
+                raise ValueError("Azure SQL requires host, database, username and password")
+        return self
 
 
 class ConnectionUpdate(BaseModel):
@@ -355,6 +367,7 @@ class OperationView(ViewModel):
     completed_at: datetime | None
     error_code: str | None
     error_message: str | None
+    transfer_error_code: str | None = None
     result_json: dict[str, Any]
     result_expires_at: datetime | None
     execution_attempt: int = Field(default=0, ge=0)
@@ -369,6 +382,7 @@ class SyncRunView(ViewModel):
     dataset_id: uuid.UUID
     status: str
     landing_batch_id: uuid.UUID
+    transfer_error_code: str | None = None
     ingestion_batch_id: uuid.UUID
     stitching_job_id: uuid.UUID
     mapping_version_id: uuid.UUID

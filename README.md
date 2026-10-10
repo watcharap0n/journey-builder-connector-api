@@ -86,6 +86,27 @@ Endpoints:
 
 ### Database connector control plane
 
+Forward-only `app_id` cutover: `POST /api/v1/workspaces` requires a **literal
+decimal string** (for example `"00042"`, distinct from `"42"`). No connector
+Bearer credential is required; `app_id` is passed through the existing connector
+pipeline as in the upload path.
+
+The sync requires a workspace app and binds it to its newly allocated
+ingestion batch before dispatch. The connector worker and the database enforce
+the workspace/connection/physical-source/batch lineage through raw, current,
+membership, and staging history. Legacy connector sources are quarantined; do
+not reactivate an old app-less schedule or reuse its physical source. File
+upload `batch_ref` parsing and upload-only publication are separate contracts;
+`CONNECTOR_PUBLICATION_STATUS_ENABLED` remains `false` until a connector
+publication contract is reviewed.
+
+When the ECS fast-operation service is scaled to zero, set
+`CONNECTOR_FAST_OPERATIONS_ENABLED=false` **on the outbox worker** so test,
+discovery, and preview requests use the normal SQS dispatcher/Step Functions
+path. This is a runtime setting, not an API-only flag. Verify both the queue
+and the outbox container environment after rollout; otherwise those requests
+are accepted but never consumed. The normal dispatch mapping must be Enabled.
+
 The connector module owns workspace-scoped PostgreSQL metadata and runtime
 state for PostgreSQL, MySQL, MariaDB, and MongoDB sources. Credentials are
 write-only API inputs; only their Secrets Manager ARN is stored in PostgreSQL.
@@ -139,6 +160,68 @@ drained before stopping it. The worker's atomic operation claim prevents duplica
 execution while both consumers are running, and the API ignores legacy results for
 fast operations with an active worker lease. The lease guard is additional
 protection, not a replacement for the drain-and-toggle sequence.
+
+### Customer publication status cutover
+
+`CONNECTOR_PUBLICATION_STATUS_ENABLED` defaults to `false`. In that compatibility
+mode, connector status and successful-record totals retain their existing
+stitching/workflow meaning; **this is not evidence of ClickHouse publication**.
+
+Activation requires an explicitly approved deployment, in this order:
+
+1. Apply `aws-flex-deploy/database/migrations/024_customer_identity_publication.sql`
+   and `025_customer_publication_status.sql` to the **same PostgreSQL database**
+   used by this API. Migration 025 also requires the existing pipeline view;
+   it preserves its OID, ACL, column order and appended history fields.
+2. As the API database role, verify `USAGE` on schema `control` and `SELECT` on
+   `control.customer_publication_status`. Migration 025 copies existing pipeline
+   view SELECT grants; provision explicit least-privilege grants if that role was
+   not an existing reader. Read `SELECT * FROM control.customer_publication_status
+   LIMIT 0` as that role before enabling. Do not grant transfer-table writes.
+3. Configure **every API replica** with `CONNECTOR_PUBLICATION_STATUS_ENABLED=true`
+   and restart/roll out those replicas (settings are process-cached). Enable this
+   only as part of the approved publication-worker/registry cutover. Poll a known
+   sync operation and run, and check connector-list totals before declaring the
+   cutover active. No frontend or upload request changes are required.
+
+When enabled, GET operation/run and POST run responses (including idempotent
+replays) use the same publication projection. Internal sync `SUCCEEDED` becomes
+`TRANSFER_PENDING`, `TRANSFERRING`, `TRANSFER_FAILED`, `TRANSFER_BLOCKED`, or final
+`COMPLETED` / `COMPLETED_WITH_WARNINGS` based on the latest stitching attempt for
+the ingestion batch. Valid post-ingestion stitching state also supersedes stale
+execution state, including an originally `FAILED` run recovered by a later retry.
+Missing lineage or unfinished ingestion does not hide a genuine pre-stitch failure.
+A missing outbox never completes; an older published attempt cannot complete a
+newer retry. Non-sync operations and stored execution statuses/errors are unchanged.
+Only published runs contribute to connector-list `successful_records`, including
+recovered executions; ingestion rejection/duplicate counters keep their existing
+execution-stage meaning. Listing uses one bulk aggregate, not one lookup per connector.
+Operation `updated_at` is the greatest of its operational timestamp and the effective
+transfer's `updated_at`; it advances with publication without rewriting stored rows.
+If capture fails before an outbox exists, migration 025 projects the latest succeeded
+job's `customer_identity_capture_issue` as `TRANSFER_BLOCKED`, including its sanitized
+reason and creation clock. A valid outbox always supersedes that journal, including
+`PUBLISHED`. Operation/run responses expose the reason as nullable
+`transfer_error_code`, separate from the unchanged execution-stage `error_code`.
+
+With the flag enabled, missing migration/view or insufficient SELECT privileges
+cause status/summary requests requiring the contract to fail (HTTP 500); there is
+**no fallback to `SUCCEEDED`**. Treat that as an incomplete deployment and repair
+schema/grants. Disabling the flag intentionally restores legacy semantics and is
+not a safe way to claim publication completion. Existing `completed_at` fields
+remain workflow timestamps, not ClickHouse publication timestamps.
+
+Local regression tests (disposable DB only, run serially with the SQL tests):
+
+```bash
+CONNECTOR_PUBLICATION_TEST_URL=postgresql+asyncpg://postgres@127.0.0.1:61577/poststitch_status_test \
+  uv run pytest tests/test_connector_publication_status.py
+```
+
+The PostgreSQL tests require the sibling `aws-flex-deploy` checkout for migration
+025. Without that local-test environment variable, they skip rather than touch a
+configured application database. HTTP/API behavior is tested; this does not claim
+frontend or production verification.
 
 ### Manual Elasticsearch standardization
 

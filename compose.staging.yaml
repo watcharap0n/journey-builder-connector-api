@@ -1,0 +1,53 @@
+name: cdp-stg-connector-api
+
+x-worker: &worker
+  image: cdp-stg-connector-api:local
+  env_file: .env.staging
+  restart: unless-stopped
+  mem_limit: 384m
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    <<: *worker
+    build: .
+    mem_limit: 512m
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - 127.0.0.1:8100:8100
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  connector-outbox:
+    <<: *worker
+    command: [python, -m, app.workers.connectors, outbox]
+    healthcheck:
+      disable: true
+
+  connector-occurrence:
+    <<: *worker
+    command: [python, -m, app.workers.connectors, occurrence]
+    healthcheck:
+      disable: true
+
+  connector-result:
+    <<: *worker
+    command: [python, -m, app.workers.connectors, result]
+    healthcheck:
+      disable: true
+
+volumes:
+  redis_data:

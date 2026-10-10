@@ -3,10 +3,25 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import (
+    DateTime,
+    SQLColumnExpression,
+    String,
+    Uuid,
+    and_,
+    case,
+    column,
+    func,
+    literal,
+    or_,
+    select,
+    table,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.modules.connectors.model import (
     ConnectorConnection,
@@ -18,6 +33,60 @@ from app.modules.connectors.model import (
     SyncRun,
     Workspace,
 )
+
+# Read-only contract owned by aws-flex-deploy migration 025, deliberately not an ORM
+# model (create_all must not synthesize a substitute). Missing schema fails closed.
+PUBLICATION_STATUS = table(
+    "customer_publication_status",
+    column("ingestion_batch_id", Uuid),
+    column("stitching_job_id", Uuid),
+    column("overall_status", String),
+    column("transfer_workspace_id", Uuid),
+    column("transfer_updated_at", DateTime(timezone=True)),
+    column("transfer_error_code", String),
+    schema="control",
+)
+
+
+def _publication_status(execution_status: SQLColumnExpression[str]) -> ColumnElement[str]:
+    # Post-ingestion states (or an explicit pipeline failure) supersede execution.
+    # A pre-created QUEUED job is not proof: unfinished ingestion reports INGESTING.
+    effective_stitching = and_(
+        PUBLICATION_STATUS.c.stitching_job_id.is_not(None),
+        PUBLICATION_STATUS.c.overall_status.in_(
+            [
+                "STITCHING_QUEUED", "WAITING_FOR_LOCK", "VALIDATING", "STITCHING",
+                "STITCHING_UNKNOWN", "FAILED", "TRANSFER_PENDING", "TRANSFERRING",
+                "TRANSFER_FAILED", "TRANSFER_BLOCKED", "COMPLETED", "COMPLETED_WITH_WARNINGS",
+            ]
+        ),
+    )
+    scoped_status = case(
+        (
+            or_(
+                PUBLICATION_STATUS.c.transfer_workspace_id != SyncRun.workspace_id,
+                and_(
+                    PUBLICATION_STATUS.c.transfer_workspace_id.is_(None),
+                    PUBLICATION_STATUS.c.overall_status.in_(
+                        ["COMPLETED", "COMPLETED_WITH_WARNINGS"]
+                    ),
+                ),
+            ),
+            "TRANSFER_BLOCKED",
+        ),
+        else_=func.coalesce(PUBLICATION_STATUS.c.overall_status, "TRANSFER_PENDING"),
+    )
+    return case(
+        (or_(execution_status == "SUCCEEDED", effective_stitching), scoped_status),
+        else_=execution_status,
+    )
+
+
+@dataclass(frozen=True)
+class PublicationProjection:
+    status: str
+    updated_at: datetime | None
+    transfer_error_code: str | None
 
 
 @dataclass(frozen=True)
@@ -45,15 +114,39 @@ class ConnectorRepository:
         return result.all()
 
     async def list_connection_summaries(
-        self, workspace_id: uuid.UUID
+        self, workspace_id: uuid.UUID, *, publication_enabled: bool = False
     ) -> Sequence[ConnectionSummary]:
         connections = await self.list_connections(workspace_id)
-        run_rows = await self.session.execute(
+        # Preserve the existing execution-stage diagnostic counters even when
+        # a later retry makes an originally failed run publicly successful.
+        read_counter: SQLColumnExpression[int] = SyncRun.records_read
+        loaded_counter: SQLColumnExpression[int] = SyncRun.records_loaded
+        rejected_counter: SQLColumnExpression[int] = SyncRun.records_rejected
+        successful = func.sum(SyncRun.records_loaded)
+        if publication_enabled:
+            read_counter = case((SyncRun.status == "SUCCEEDED", SyncRun.records_read), else_=0)
+            loaded_counter = case((SyncRun.status == "SUCCEEDED", SyncRun.records_loaded), else_=0)
+            rejected_counter = case(
+                (SyncRun.status == "SUCCEEDED", SyncRun.records_rejected), else_=0
+            )
+            successful = func.sum(
+                case(
+                    (
+                        _publication_status(SyncRun.status).in_(
+                            ["COMPLETED", "COMPLETED_WITH_WARNINGS"]
+                        ),
+                        SyncRun.records_loaded,
+                    ),
+                    else_=0,
+                )
+            )
+        run_query = (
             select(
                 ConnectorDataset.connection_id,
-                func.sum(SyncRun.records_read).label("records_read"),
-                func.sum(SyncRun.records_loaded).label("records_loaded"),
-                func.sum(SyncRun.records_rejected).label("records_rejected"),
+                func.sum(read_counter).label("records_read"),
+                func.sum(loaded_counter).label("records_loaded"),
+                func.sum(rejected_counter).label("records_rejected"),
+                successful.label("successful_records"),
             )
             .join(
                 SyncRun,
@@ -62,17 +155,23 @@ class ConnectorRepository:
                     SyncRun.workspace_id == ConnectorDataset.workspace_id,
                 ),
             )
-            .where(
-                ConnectorDataset.workspace_id == workspace_id,
-                SyncRun.status == "SUCCEEDED",
-            )
+            .where(ConnectorDataset.workspace_id == workspace_id)
             .group_by(ConnectorDataset.connection_id)
         )
+        if publication_enabled:
+            run_query = run_query.outerjoin(
+                PUBLICATION_STATUS,
+                PUBLICATION_STATUS.c.ingestion_batch_id == SyncRun.ingestion_batch_id,
+            )
+        else:
+            run_query = run_query.where(SyncRun.status == "SUCCEEDED")
+        run_rows = await self.session.execute(run_query)
         run_totals = {
             row.connection_id: (
                 int(row.records_read or 0),
                 int(row.records_loaded or 0),
                 int(row.records_rejected or 0),
+                int(row.successful_records or 0),
             )
             for row in run_rows
         }
@@ -98,8 +197,8 @@ class ConnectorRepository:
 
         summaries: list[ConnectionSummary] = []
         for connection in connections:
-            records_read, records_loaded, records_rejected = run_totals.get(
-                connection.connection_id, (0, 0, 0)
+            records_read, records_loaded, records_rejected, successful_records = run_totals.get(
+                connection.connection_id, (0, 0, 0, 0)
             )
             configured_frequencies = frequencies.get(connection.connection_id, set())
             frequency = (
@@ -112,7 +211,7 @@ class ConnectorRepository:
             summaries.append(
                 ConnectionSummary(
                     connection=connection,
-                    successful_records=records_loaded,
+                    successful_records=successful_records,
                     error_records=records_rejected,
                     duplicate_records=max(
                         records_read - records_loaded - records_rejected, 0
@@ -220,6 +319,44 @@ class ConnectorRepository:
                     ConnectorOperation.operation_id == operation_id,
                 )
             )
+        )
+
+    async def get_operation_publication_projection(
+        self, workspace_id: uuid.UUID, operation_id: uuid.UUID, *, execution_status: str
+    ) -> PublicationProjection:
+        result = await self.session.execute(
+            select(
+                _publication_status(literal(execution_status)).label("status"),
+                func.greatest(
+                    ConnectorOperation.updated_at, PUBLICATION_STATUS.c.transfer_updated_at
+                ).label("updated_at"),
+                PUBLICATION_STATUS.c.transfer_error_code,
+            )
+            .select_from(SyncRun)
+            .join(
+                ConnectorOperation,
+                and_(
+                    ConnectorOperation.operation_id == SyncRun.operation_id,
+                    ConnectorOperation.workspace_id == SyncRun.workspace_id,
+                ),
+            )
+            .outerjoin(
+                PUBLICATION_STATUS,
+                PUBLICATION_STATUS.c.ingestion_batch_id == SyncRun.ingestion_batch_id,
+            )
+            .where(SyncRun.workspace_id == workspace_id, SyncRun.operation_id == operation_id)
+        )
+        projected = result.one_or_none()
+        if projected is not None:
+            return PublicationProjection(
+                status=projected.status,
+                updated_at=projected.updated_at,
+                transfer_error_code=projected.transfer_error_code,
+            )
+        return PublicationProjection(
+            status="TRANSFER_PENDING" if execution_status == "SUCCEEDED" else execution_status,
+            updated_at=None,
+            transfer_error_code=None,
         )
 
     async def get_sync_run(

@@ -75,6 +75,27 @@ Example MariaDB connection configuration:
 }
 ```
 
+Example Azure SQL Database connection configuration (SQL authentication, encrypted TDS):
+```json
+{
+  "engine": "azure_sql",
+  "name": "Azure SQL Customer POC",
+  "source_code": "azure_sql_customer_poc",
+  "endpoint_label": "Azure SQL Customer Database",
+  "safe_config": {},
+  "credentials": {
+    "host": "server.database.windows.net",
+    "port": 1433,
+    "username": "reader",
+    "password": "replace-with-password",
+    "database": "customer_db"
+  }
+}
+```
+Supports table discovery, bounded preview, full snapshot and incremental sync
+using a cursor and primary key. Azure SQL requires SQL authentication; URI and
+Entra ID authentication and SSH tunnels are not supported by this adapter.
+
 Example MongoDB connection configuration:
 ```json
 {

@@ -39,14 +39,23 @@ async def process_outbox_once(
                 await session.execute(
                     text(
                         """
-                        SELECT outbox_event_id, payload_json, attempt
-                        FROM control.standardization_outbox_event
-                        WHERE status IN ('PENDING','FAILED','PROCESSING')
-                          AND available_at <= now()
-                        ORDER BY created_at
+                        SELECT outbox.outbox_event_id, outbox.payload_json, outbox.attempt
+                        FROM control.standardization_outbox_event AS outbox
+                        JOIN control.standardization_run AS run ON run.run_id = outbox.run_id
+                        WHERE outbox.status IN ('PENDING','FAILED','PROCESSING')
+                          AND outbox.workspace_id IS NOT NULL
+                          AND run.workspace_id IS NOT NULL
+                          {scope_guard}
+                          AND outbox.available_at <= now()
+                        ORDER BY outbox.created_at
                         LIMIT 1
-                        FOR UPDATE SKIP LOCKED
-                        """
+                        FOR UPDATE OF outbox SKIP LOCKED
+                        """.format(
+                            scope_guard=(
+                                "AND run.run_scope = 'legacy'"
+                                if settings.standardization_legacy_scope_enabled else ""
+                            )
+                        )
                     )
                 )
             ).first()
@@ -85,7 +94,13 @@ async def process_outbox_once(
                     SET run_status = 'RUNNING', started_at = COALESCE(started_at, now()),
                         updated_at = now()
                     WHERE run_id = :run_id AND run_status = 'PENDING'
-                    """
+                      {scope_guard}
+                    """.format(
+                        scope_guard=(
+                            "AND run_scope = 'legacy'"
+                            if settings.standardization_legacy_scope_enabled else ""
+                        )
+                    )
                 ),
                 {"run_id": uuid.UUID(payload["run_id"])},
             )
@@ -113,7 +128,8 @@ async def process_outbox_once(
 
 
 async def process_result_message(
-    session_factory: async_sessionmaker[AsyncSession], payload: dict[str, Any]
+    session_factory: async_sessionmaker[AsyncSession], payload: dict[str, Any],
+    *, legacy_scope_enabled: bool = False,
 ) -> None:
     run_id = uuid.UUID(payload["run_id"])
     source_index = str(payload["source_index"])
@@ -123,6 +139,24 @@ async def process_result_message(
         raise ValueError("standardization result status must be terminal")
     metrics = payload.get("metrics") or {}
     async with session_factory() as session:
+        # The existing workspace association fences unowned runs even before the
+        # run_scope column is installed. Scope is added only after the migration.
+        permitted = (
+            await session.execute(
+                text("""
+                    SELECT 1 FROM control.standardization_run AS run
+                    WHERE run.run_id = :run_id
+                      AND run.workspace_id IS NOT NULL
+                      {scope_guard}
+                    FOR UPDATE OF run
+                """.format(
+                    scope_guard="AND run.run_scope = 'legacy'" if legacy_scope_enabled else ""
+                )),
+                {"run_id": run_id},
+            )
+        ).first()
+        if permitted is None:
+            raise RuntimeError("legacy standardization run not found")
         if terminal_status == "FAILED":
             checkpoint = (
                 await session.execute(
@@ -238,12 +272,12 @@ async def process_result_message(
                 },
             )
 
-        await _finalize_run_if_terminal(session, run_id)
+        await _finalize_run_if_terminal(session, run_id, legacy_scope_enabled=legacy_scope_enabled)
         await session.commit()
 
 
 async def _finalize_run_if_terminal(
-    session: AsyncSession, run_id: uuid.UUID
+    session: AsyncSession, run_id: uuid.UUID, *, legacy_scope_enabled: bool = False
 ) -> bool:
     aggregate = (
             await session.execute(
@@ -291,7 +325,10 @@ async def _finalize_run_if_terminal(
                 error_code = CASE WHEN :failed > 0 THEN 'PARTITION_FAILED' ELSE NULL END
             WHERE run_id = :run_id
               AND run_status IN ('PENDING','RUNNING')
-            """
+              {scope_guard}
+            """.format(
+                scope_guard="AND run_scope = 'legacy'" if legacy_scope_enabled else ""
+            )
         ),
         {
             "run_status": run_status,
@@ -308,7 +345,8 @@ async def _finalize_run_if_terminal(
 
 
 async def reconcile_partition_once(
-    session_factory: async_sessionmaker[AsyncSession], stale_seconds: int
+    session_factory: async_sessionmaker[AsyncSession], stale_seconds: int,
+    *, legacy_scope_enabled: bool = False,
 ) -> bool:
     async with session_factory() as session:
         checkpoint = (
@@ -323,6 +361,7 @@ async def reconcile_partition_once(
                     JOIN control.standardization_run AS run USING (run_id)
                     WHERE run.run_status IN ('PENDING','RUNNING')
                       AND run.workspace_id IS NOT NULL
+                      {scope_guard}
                       AND (
                           checkpoint.checkpoint_status = 'FAILED'
                           OR (
@@ -334,7 +373,9 @@ async def reconcile_partition_once(
                     ORDER BY checkpoint.updated_at
                     LIMIT 1
                     FOR UPDATE OF checkpoint SKIP LOCKED
-                    """
+                    """.format(
+                        scope_guard="AND run.run_scope = 'legacy'" if legacy_scope_enabled else ""
+                    )
                 ),
                 {"stale_seconds": stale_seconds},
             )
@@ -407,7 +448,9 @@ async def reconcile_partition_once(
                         "payload": json.dumps(retry_payload),
                     },
                 )
-            await _finalize_run_if_terminal(session, values["run_id"])
+            await _finalize_run_if_terminal(
+                session, values["run_id"], legacy_scope_enabled=legacy_scope_enabled
+            )
             await session.commit()
             return True
 
@@ -419,6 +462,7 @@ async def reconcile_partition_once(
                     FROM control.standardization_run AS run
                     WHERE run.run_status IN ('PENDING','RUNNING')
                       AND run.workspace_id IS NOT NULL
+                      {scope_guard}
                       AND EXISTS (
                           SELECT 1
                           FROM control.standardization_checkpoint AS checkpoint
@@ -434,13 +478,17 @@ async def reconcile_partition_once(
                     ORDER BY run.created_at
                     LIMIT 1
                     FOR UPDATE OF run SKIP LOCKED
-                    """
+                    """.format(
+                        scope_guard="AND run.run_scope = 'legacy'" if legacy_scope_enabled else ""
+                    )
                 )
             )
         ).first()
         if finalizable_run is None:
             return False
-        await _finalize_run_if_terminal(session, finalizable_run._mapping["run_id"])
+        await _finalize_run_if_terminal(
+            session, finalizable_run._mapping["run_id"], legacy_scope_enabled=legacy_scope_enabled
+        )
         await session.commit()
         return True
 
@@ -483,6 +531,7 @@ async def run_worker(mode: str) -> None:
                 reconciled = await reconcile_partition_once(
                     session_factory,
                     settings.standardization_stale_partition_seconds,
+                    legacy_scope_enabled=settings.standardization_legacy_scope_enabled,
                 )
                 processed = await process_outbox_once(session_factory, settings)
                 if not processed and not reconciled:
@@ -492,7 +541,10 @@ async def run_worker(mode: str) -> None:
                 raise RuntimeError("STANDARDIZATION_RESULT_QUEUE_URL is not configured")
 
             async def result_handler(payload: dict[str, Any]) -> None:
-                await process_result_message(session_factory, payload)
+                await process_result_message(
+                    session_factory, payload,
+                    legacy_scope_enabled=settings.standardization_legacy_scope_enabled,
+                )
 
             await _consume_queue(
                 settings,

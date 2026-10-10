@@ -44,13 +44,14 @@ async def post_standardization_run(
     idempotency_key: IdempotencyKey = None,
 ) -> StandardizationRunView:
     try:
-        inventory = await discover_source_inventory(settings)
+        inventory = await discover_source_inventory(settings, dataset_id)
         return await create_manual_run(
             session,
             workspace_id=workspace_id,
             dataset_id=dataset_id,
             inventory=inventory,
             idempotency_key=idempotency_key,
+            legacy_scope_enabled=settings.standardization_legacy_scope_enabled,
         )
     except Exception as exc:
         raise _translate_error(exc) from exc
@@ -64,9 +65,13 @@ async def get_standardization_run(
     workspace_id: uuid.UUID,
     run_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> StandardizationRunView:
     try:
-        return await get_run(session, workspace_id, run_id)
+        return await get_run(
+            session, workspace_id, run_id,
+            legacy_scope_enabled=settings.standardization_legacy_scope_enabled,
+        )
     except Exception as exc:
         raise _translate_error(exc) from exc
 

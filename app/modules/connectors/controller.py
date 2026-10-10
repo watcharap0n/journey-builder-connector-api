@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.infrastructure.database.session import get_db_session
+from app.modules.connectors.model import SyncRun
 from app.modules.connectors.repository import ConnectorRepository
 from app.modules.connectors.schemas import (
     ConnectionCreate,
@@ -131,10 +132,17 @@ async def post_connection(
     "/workspaces/{workspace_id}/connectors", response_model=list[ConnectionListView]
 )
 async def get_connections(
-    workspace_id: uuid.UUID, session: SessionDep
+    workspace_id: uuid.UUID, session: SessionDep, settings: SettingsDep
 ) -> Sequence[ConnectionListView]:
-    await get_workspace(session, workspace_id)
-    rows = await ConnectorRepository(session).list_connection_summaries(workspace_id)
+    try:
+        await get_workspace(session, workspace_id)
+    except ConnectorNotFoundError as exc:
+        raise _translate_error(exc) from exc
+    repository = ConnectorRepository(session)
+    if settings.connector_publication_status_enabled:
+        rows = await repository.list_connection_summaries(workspace_id, publication_enabled=True)
+    else:
+        rows = await repository.list_connection_summaries(workspace_id)
     return [
         ConnectionListView(
             **ConnectionView.model_validate(row.connection).model_dump(),
@@ -438,7 +446,7 @@ async def post_run_now(
             trigger_type="MANUAL",
             idempotency_key=idempotency_key or str(uuid.uuid4()),
         )
-        return SyncRunView.model_validate(run)
+        return await _sync_run_view(ConnectorRepository(session), settings, run)
     except Exception as exc:
         raise _translate_error(exc) from exc
 
@@ -450,11 +458,27 @@ async def get_operation(
     workspace_id: uuid.UUID,
     operation_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> OperationView:
-    row = await ConnectorRepository(session).get_operation(workspace_id, operation_id)
+    repository = ConnectorRepository(session)
+    row = await repository.get_operation(workspace_id, operation_id)
     if row is None:
         raise HTTPException(status_code=404, detail="operation not found")
     view = OperationView.model_validate(row)
+    if (
+        settings.connector_publication_status_enabled
+        and row.operation_type == "DATASET_SYNC"
+    ):
+        projection = await repository.get_operation_publication_projection(
+            workspace_id, operation_id, execution_status=row.status
+        )
+        view = view.model_copy(
+            update={
+                "status": projection.status,
+                "updated_at": projection.updated_at or view.updated_at,
+                "transfer_error_code": projection.transfer_error_code,
+            }
+        )
     return _hide_expired_preview_result(view, now=datetime.now(UTC))
 
 
@@ -465,11 +489,30 @@ async def get_run(
     workspace_id: uuid.UUID,
     sync_run_id: uuid.UUID,
     session: SessionDep,
+    settings: SettingsDep,
 ) -> SyncRunView:
-    row = await ConnectorRepository(session).get_sync_run(workspace_id, sync_run_id)
+    repository = ConnectorRepository(session)
+    row = await repository.get_sync_run(workspace_id, sync_run_id)
     if row is None:
         raise HTTPException(status_code=404, detail="sync run not found")
-    return SyncRunView.model_validate(row)
+    return await _sync_run_view(repository, settings, row)
+
+
+async def _sync_run_view(
+    repository: ConnectorRepository, settings: Settings, row: SyncRun
+) -> SyncRunView:
+    view = SyncRunView.model_validate(row)
+    if settings.connector_publication_status_enabled:
+        projection = await repository.get_operation_publication_projection(
+            row.workspace_id, row.operation_id, execution_status=row.status
+        )
+        view = view.model_copy(
+            update={
+                "status": projection.status,
+                "transfer_error_code": projection.transfer_error_code,
+            }
+        )
+    return view
 
 
 @router.delete(

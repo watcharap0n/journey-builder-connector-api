@@ -57,9 +57,15 @@ class Settings(BaseSettings):
     connector_scheduler_group: str | None = None
     connector_scheduler_role_arn: str | None = None
     connector_runtime_workspace_id: str | None = None
+    # Enable only after aws-flex-deploy migrations 024/025 and API SELECT grants.
+    connector_publication_status_enabled: bool = False
     connector_worker_poll_seconds: int = Field(default=1, ge=1, le=300)
 
     standardization_source_secret_id: str | None = None
+    # Inventory excludes dataset-1 trackers_2026 independently of this flag.
+    # After the run_scope migration, enable on every API/worker before seeding 2026.
+    # The default remains compatible with the pre-migration schema and live 2025 run.
+    standardization_legacy_scope_enabled: bool = False
     standardization_source_database: str = "elasticsearch"
     standardization_source_sslmode: Literal[
         "disable", "allow", "prefer", "require", "verify-ca", "verify-full"

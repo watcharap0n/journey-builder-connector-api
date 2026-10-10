@@ -283,7 +283,9 @@ CREATE INDEX ix_outbox_pending
 """
 def _execute_sql_block(sql_block: str) -> None:
     for statement in (chunk.strip() for chunk in sql_block.split(";") if chunk.strip()):
-        op.execute(statement)
+        # These statements contain JSON literals such as `"snapshot":true`.
+        # Execute the SQL verbatim so SQLAlchemy does not parse them as binds.
+        op.get_bind().exec_driver_sql(statement)
 
 
 def upgrade() -> None:

@@ -45,6 +45,28 @@ from app.workers.connectors import (
 )
 
 
+def test_azure_sql_connection_payload_is_accepted() -> None:
+    connection = ConnectionCreate.model_validate({
+        "engine": "azure_sql", "name": "Azure CRM", "source_code": "azure_crm",
+        "credentials": {
+            "host": "crm.database.windows.net", "port": 1433,
+            "database": "crm", "username": "reader", "password": "secret",
+        },
+    })
+    assert connection.engine == "azure_sql"
+    assert connection.credentials.secret_payload()["database"] == "crm"
+
+    with pytest.raises(ValidationError, match="direct host connection"):
+        ConnectionCreate.model_validate({
+            "engine": "azure_sql", "name": "Azure CRM", "source_code": "azure_crm",
+            "credentials": {
+                "host": "crm.database.windows.net", "database": "crm",
+                "username": "reader", "password": "secret",
+                "tunnel": {"host": "bastion", "username": "ubuntu", "password": "secret"},
+            },
+        })
+
+
 def test_connection_identity_is_unique_only_within_workspace() -> None:
     existing = [
         cast(
@@ -550,7 +572,9 @@ async def test_get_connections_includes_record_summary(
     monkeypatch.setattr(controller, "get_workspace", fake_get_workspace)
     monkeypatch.setattr(controller, "ConnectorRepository", FakeRepository)
 
-    result = await controller.get_connections(workspace_id, object())  # type: ignore[arg-type]
+    result = await controller.get_connections(
+        workspace_id, object(), Settings(_env_file=None)
+    )  # type: ignore[arg-type]
 
     assert result[0].successful_records == 105_636
     assert result[0].error_records == 4

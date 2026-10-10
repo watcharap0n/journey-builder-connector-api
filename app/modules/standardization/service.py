@@ -39,20 +39,22 @@ SELECT indices.source_index,
            WHERE version.source_index = indices.source_index
        ) AS version_cutoff_ingest_id
 FROM migration.elasticsearch_indices AS indices
-WHERE EXISTS (
+WHERE (EXISTS (
           SELECT 1 FROM raw.elasticsearch_documents AS document
           WHERE document.source_index = indices.source_index
       )
    OR EXISTS (
           SELECT 1 FROM raw.elasticsearch_document_versions AS version
           WHERE version.source_index = indices.source_index
-      )
+      ))
+  AND ($1 <> 1 OR indices.source_index NOT LIKE 'trackers!_2026%' ESCAPE '!')
 ORDER BY indices.source_index
 """
 
 
 async def discover_source_inventory(
     settings: Settings,
+    dataset_id: int,
 ) -> list[SourcePartitionInventory]:
     if not settings.standardization_source_secret_id:
         raise StandardizationConfigurationError(
@@ -75,7 +77,7 @@ async def discover_source_inventory(
         server_settings={"application_name": "standardization_run_planner"},
     )
     try:
-        rows = await connection.fetch(INVENTORY_SQL)
+        rows = await connection.fetch(INVENTORY_SQL, dataset_id)
     finally:
         await connection.close()
     return [SourcePartitionInventory.model_validate(dict(row)) for row in rows]
@@ -116,13 +118,15 @@ FROM control.standardization_run
 
 
 async def get_run(
-    session: AsyncSession, workspace_id: uuid.UUID, run_id: uuid.UUID
+    session: AsyncSession, workspace_id: uuid.UUID, run_id: uuid.UUID,
+    *, legacy_scope_enabled: bool = False,
 ) -> StandardizationRunView:
     row = (
         await session.execute(
             text(
                 RUN_SELECT
                 + " WHERE run_id = :run_id AND workspace_id = :workspace_id"
+                + (" AND run_scope = 'legacy'" if legacy_scope_enabled else "")
             ),
             {"run_id": run_id, "workspace_id": workspace_id},
         )
@@ -139,6 +143,7 @@ async def create_manual_run(
     dataset_id: int,
     inventory: list[SourcePartitionInventory],
     idempotency_key: str | None,
+    legacy_scope_enabled: bool = False,
 ) -> StandardizationRunView:
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:dataset_id)"),
@@ -180,8 +185,9 @@ async def create_manual_run(
                       WHERE dataset_id = :dataset_id
                         AND workspace_id = :workspace_id
                         AND source_run_key = :source_run_key
-                      LIMIT 1
                     """
+                    + (" AND run_scope = 'legacy'" if legacy_scope_enabled else "")
+                    + " LIMIT 1"
                 ),
                 {
                     "dataset_id": dataset_id,
@@ -201,59 +207,51 @@ async def create_manual_run(
                 + """
                   WHERE dataset_id = :dataset_id
                     AND run_status IN ('PENDING','RUNNING')
-                  ORDER BY created_at DESC
-                  LIMIT 1
-                  FOR UPDATE
                 """
+                + (" AND run_scope = 'legacy'" if legacy_scope_enabled else "")
+                + " ORDER BY created_at DESC LIMIT 1 FOR UPDATE"
             ),
             {"dataset_id": dataset_id},
         )
     ).first()
-    if active is not None and active._mapping["workspace_id"] is not None:
+    if active is not None:
+        if active._mapping["workspace_id"] is None:
+            raise StandardizationConfigurationError("unowned legacy run cannot be adopted")
         await session.commit()
         return _run_view(active)
 
-    if active is None:
-        run_id = uuid.uuid4()
-        source_run_key = (
-            f"manual:{workspace_id}:{idempotency_key}"
-            if idempotency_key
-            else f"manual:{workspace_id}:{run_id}"
-        )
-        await session.execute(
-            text(
-                """
-                INSERT INTO control.standardization_run (
-                    run_id, dataset_id, workspace_id, source_run_key,
-                    run_status, trigger_type, adapter_version, contract_version
-                ) VALUES (
-                    :run_id, :dataset_id, :workspace_id, :source_run_key,
-                    'PENDING', 'MANUAL', :adapter_version, :contract_version
-                )
-                """
-            ),
-            {
-                "run_id": run_id,
-                "dataset_id": dataset_id,
-                "workspace_id": workspace_id,
-                "source_run_key": source_run_key,
-                "adapter_version": dataset._mapping["adapter_version"],
-                "contract_version": dataset._mapping["contract_version"],
-            },
-        )
-    else:
-        run_id = active._mapping["run_id"]
-        await session.execute(
-            text(
-                """
-                UPDATE control.standardization_run
-                SET workspace_id = :workspace_id, trigger_type = 'MANUAL',
-                    updated_at = now()
-                WHERE run_id = :run_id AND workspace_id IS NULL
-                """
-            ),
-            {"workspace_id": workspace_id, "run_id": run_id},
-        )
+    run_id = uuid.uuid4()
+    source_run_key = (
+        f"manual:{workspace_id}:{idempotency_key}"
+        if idempotency_key
+        else f"manual:{workspace_id}:{run_id}"
+    )
+    await session.execute(
+        text(
+            """
+            INSERT INTO control.standardization_run (
+                run_id, dataset_id, workspace_id, source_run_key,
+                run_status, trigger_type, adapter_version, contract_version
+                {scope_column}
+            ) VALUES (
+                :run_id, :dataset_id, :workspace_id, :source_run_key,
+                'PENDING', 'MANUAL', :adapter_version, :contract_version
+                {scope_value}
+            )
+            """.format(
+                scope_column=", run_scope" if legacy_scope_enabled else "",
+                scope_value=", 'legacy'" if legacy_scope_enabled else "",
+            )
+        ),
+        {
+            "run_id": run_id,
+            "dataset_id": dataset_id,
+            "workspace_id": workspace_id,
+            "source_run_key": source_run_key,
+            "adapter_version": dataset._mapping["adapter_version"],
+            "contract_version": dataset._mapping["contract_version"],
+        },
+    )
 
     queued_work_items = 0
     queued_index_names: set[str] = set()
@@ -447,4 +445,6 @@ async def create_manual_run(
         },
     )
     await session.commit()
-    return await get_run(session, workspace_id, run_id)
+    return await get_run(
+        session, workspace_id, run_id, legacy_scope_enabled=legacy_scope_enabled
+    )

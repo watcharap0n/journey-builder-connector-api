@@ -69,7 +69,12 @@ echo "waiting for services to stabilize..."
 aws ecs wait services-stable --cluster "$cluster" --services "${services[@]}"
 
 for svc in "${services[@]}"; do
-  state="$(aws ecs describe-services --cluster "$cluster" --services "$svc" --query 'services[0].deployments[0].rolloutState' --output text)"
+  # Services without a load balancer turn COMPLETED a little after services-stable.
+  for _ in $(seq 1 60); do
+    state="$(aws ecs describe-services --cluster "$cluster" --services "$svc" --query 'services[0].deployments[0].rolloutState' --output text)"
+    [[ "$state" == "IN_PROGRESS" ]] || break
+    sleep 10
+  done
   [[ "$state" == "COMPLETED" ]] || { echo "$svc rollout state $state (circuit breaker rolled back?)" >&2; exit 1; }
 done
 

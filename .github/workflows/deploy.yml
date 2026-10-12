@@ -2,13 +2,14 @@ name: CI and deploy
 
 on:
   push:
-    branches: [master]
+    branches: [master, develop]
   pull_request:
-    branches: [master]
+    branches: [master, develop]
   workflow_dispatch:
 
+# master -> prod (ECS cdp-prod-apps); develop -> staging (cdp-stg box, Mon-Fri 08-20 ICT).
 concurrency:
-  group: connector-api-prod-deploy
+  group: connector-api-${{ github.ref_name }}-deploy
   cancel-in-progress: false
 
 permissions:
@@ -66,3 +67,37 @@ jobs:
             --cluster "$ECS_CLUSTER" --repo "$ECR_REPO" --tag "$GITHUB_SHA" \
             --migrate "alembic upgrade head" \
             connector-api connector-workers
+
+  staging:
+    if: github.ref == 'refs/heads/develop' && github.event_name != 'pull_request'
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_ROLE_ARN: arn:aws:iam::538783577018:role/cdp-github-deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push arm64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Deploy to the staging box (alembic upgrade runs as the migrate one-shot)
+        run: |
+          .github/scripts/staging-deploy.sh --dir /home/ec2-user/staging-apps/connector-api \
+            --tag "$GITHUB_SHA" --healthy "api"

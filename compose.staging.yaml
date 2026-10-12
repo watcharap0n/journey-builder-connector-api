@@ -1,7 +1,10 @@
 name: cdp-stg-connector-api
+# Staging on the cdp-stg box (Mon-Fri 08:00-20:00 ICT). Deployed by CI from the develop
+# branch through .github/scripts/staging-deploy.sh, which writes REGISTRY/IMAGE_TAG into .env.
+# Secrets and DB settings: .env.staging on the box. migrate runs alembic like prod CI.
 
 x-worker: &worker
-  image: cdp-stg-connector-api:local
+  image: ${REGISTRY}/cdp/connector-api:${IMAGE_TAG}
   env_file: .env.staging
   restart: unless-stopped
   mem_limit: 384m
@@ -19,9 +22,15 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    <<: *worker
+    restart: "no"
+    command: [alembic, upgrade, head]
+    healthcheck:
+      disable: true
+
   api:
     <<: *worker
-    build: .
     mem_limit: 512m
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -30,6 +39,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   connector-outbox:
     <<: *worker

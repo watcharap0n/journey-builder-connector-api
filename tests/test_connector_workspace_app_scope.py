@@ -138,7 +138,8 @@ async def test_legacy_workspace_without_app_cannot_start_connector_sync(
             pass
 
         async def get_dataset(self, _workspace_id: uuid.UUID, _dataset_id: uuid.UUID):
-            return type("Dataset", (), {"active_mapping_version_id": uuid.uuid4()})()
+            fields = {"active_mapping_version_id": uuid.uuid4(), "target_entity": "CUSTOMER"}
+            return type("Dataset", (), fields)()
 
         async def get_workspace(self, _workspace_id: uuid.UUID):
             return workspace

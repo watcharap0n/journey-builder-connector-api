@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.modules.connectors.entities import mapping_errors
 from app.modules.connectors.model import (
     ConnectorConnection,
     ConnectorDataset,
@@ -129,7 +130,8 @@ def _validate_mapping_source_paths(
         {
             field.source_path
             for field in payload.fields
-            if field.source_path not in available_paths
+            if field.source_path is not None
+            and field.source_path not in available_paths
             and not any(field.source_path.startswith(f"{root}.") for root in nested_roots)
         }
     )
@@ -438,6 +440,13 @@ async def update_dataset(
     if dataset is None:
         raise ConnectorNotFoundError("dataset not found")
     changes = payload.model_dump(exclude_unset=True)
+    new_entity = changes.pop("target_entity", None)
+    if new_entity is not None and new_entity != dataset.target_entity:
+        if dataset.status == "ACTIVE":
+            raise ConnectorConflictError("pause the dataset before changing its target_entity")
+        dataset.target_entity = new_entity
+        dataset.active_mapping_version_id = None  # the old mapping belongs to another contract
+        dataset.status = "DISCOVERED"
     for key, value in changes.items():
         setattr(dataset, key, value)
     if dataset.sync_mode == "INCREMENTAL" and not dataset.cursor_paths:
@@ -468,8 +477,20 @@ async def create_mapping(
     )
     if snapshot is None:
         raise ConnectorConfigurationError("schema snapshot does not belong to dataset")
+    errors = mapping_errors(
+        dataset.target_entity,
+        (field.target_field for field in payload.fields),
+        constant_targets=(
+            field.target_field for field in payload.fields if field.constant is not None
+        ),
+    )
+    if errors:
+        raise ConnectorConfigurationError("; ".join(errors))
     _validate_mapping_source_paths(snapshot.schema_json, payload)
-    mapping_json = {"fields": [field.model_dump(mode="json") for field in payload.fields]}
+    mapping_json = {
+        "target_entity": dataset.target_entity,
+        "fields": [field.model_dump(mode="json", exclude_none=True) for field in payload.fields],
+    }
     mapping = MappingVersion(
         workspace_id=workspace_id,
         dataset_id=dataset_id,
@@ -496,9 +517,17 @@ async def publish_mapping(
     dataset = await repository.get_dataset(workspace_id, mapping.dataset_id)
     if dataset is None:
         raise ConnectorNotFoundError("dataset not found")
-    targets = {field["target_field"] for field in mapping.mapping_json.get("fields", [])}
-    if "source_customer_id" not in targets:
-        raise ConnectorConfigurationError("mapping requires source_customer_id")
+    entity = mapping.mapping_json.get("target_entity", "CUSTOMER")
+    if entity != dataset.target_entity:
+        raise ConnectorConfigurationError("mapping was built for another target_entity")
+    fields = mapping.mapping_json.get("fields", [])
+    errors = mapping_errors(
+        entity,
+        (field["target_field"] for field in fields),
+        constant_targets=(field["target_field"] for field in fields if "constant" in field),
+    )
+    if errors:
+        raise ConnectorConfigurationError("; ".join(errors))
     mapping.status = "PUBLISHED"
     mapping.published_at = _utcnow()
     dataset.active_mapping_version_id = mapping.mapping_version_id
@@ -613,6 +642,12 @@ async def materialize_sync_run(
         raise ConnectorNotFoundError("dataset not found")
     if dataset.active_mapping_version_id is None:
         raise ConnectorConfigurationError("dataset has no published mapping")
+    # The model default only applies on flush, so an unsaved dataset can still carry None.
+    entity = dataset.target_entity or "CUSTOMER"
+    if entity != "CUSTOMER" and not settings.connector_generic_entities_enabled:
+        raise ConnectorConflictError(
+            f"{entity} datasets cannot sync until the connector worker supports them"
+        )
     workspace = await session.get(Workspace, workspace_id, with_for_update=True)
     if workspace is None:
         raise ConnectorNotFoundError("workspace not found")

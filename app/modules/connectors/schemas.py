@@ -7,42 +7,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from app.modules.connectors.entities import (
+    ALL_TARGET_FIELDS,
+    TargetEntity,
+)
+
 ConnectorEngine = Literal["postgresql", "mysql", "mariadb", "mongodb", "azure_sql"]
-CUSTOMER_TARGET_FIELDS = {
-    "source_customer_id",
-    "external_id",
-    "first_name",
-    "middle_name",
-    "last_name",
-    "full_name",
-    "nickname",
-    "gender",
-    "date_of_birth",
-    "birthday",
-    "age",
-    "email",
-    "phone",
-    "line_user_id",
-    "facebook_id",
-    "google_id",
-    "apple_id",
-    "member_code",
-    "customer_type",
-    "status",
-    "language",
-    "address_line_1",
-    "address_line_2",
-    "district",
-    "province",
-    "postal_code",
-    "country",
-    "source",
-    "source_system",
-    "external_ids",
-    "attributes",
-    "source_created_at",
-    "source_updated_at",
-}
 
 
 class ViewModel(BaseModel):
@@ -205,6 +175,8 @@ class ConnectionListView(ConnectionView):
 
 
 class DatasetUpdate(BaseModel):
+    # Changing the dataset type drops its published mapping (a new one must be created).
+    target_entity: TargetEntity | None = None
     sync_mode: Literal["FULL_SNAPSHOT", "INCREMENTAL"] | None = None
     primary_key_paths: list[str] | None = None
     cursor_paths: list[str] | None = None
@@ -253,27 +225,36 @@ class SchemaSnapshotView(ViewModel):
 
 
 class FieldMapping(BaseModel):
-    source_path: str = Field(min_length=1, max_length=500)
+    # Exactly one of source_path (a source column) or constant (e.g. currency "THB").
+    source_path: str | None = Field(default=None, min_length=1, max_length=500)
+    constant: str | int | float | bool | None = None
     target_field: str = Field(min_length=1, max_length=100)
     transforms: list[
         Literal["trim", "lowercase", "uppercase", "parse_date", "parse_timestamp", "stringify"]
     ] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def source_or_constant(self) -> FieldMapping:
+        if (self.source_path is None) == (self.constant is None):
+            raise ValueError("each field needs exactly one of source_path or constant")
+        return self
+
 
 class MappingCreate(BaseModel):
+    """Entity-specific rules (required fields per dataset type) are checked against the
+    dataset's target_entity in the service, because the payload does not carry it."""
+
     schema_snapshot_id: uuid.UUID
     fields: list[FieldMapping] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def require_source_customer_id(self) -> MappingCreate:
+    def unique_known_targets(self) -> MappingCreate:
         targets = {field.target_field for field in self.fields}
-        if "source_customer_id" not in targets:
-            raise ValueError("mapping requires target_field source_customer_id")
         if len(targets) != len(self.fields):
             raise ValueError("mapping target_field values must be unique")
-        unsupported = sorted(targets - CUSTOMER_TARGET_FIELDS)
+        unsupported = sorted(targets - ALL_TARGET_FIELDS)
         if unsupported:
-            raise ValueError("unsupported customer target_field: " + ", ".join(unsupported))
+            raise ValueError("unsupported target_field: " + ", ".join(unsupported))
         return self
 
 

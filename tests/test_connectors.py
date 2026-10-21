@@ -1,6 +1,7 @@
 import json
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -15,6 +16,7 @@ from app.core.config import Settings
 from app.main import create_app
 from app.modules.connectors import controller
 from app.modules.connectors.controller import _hide_expired_preview_result
+from app.modules.connectors.entities import mapping_errors
 from app.modules.connectors.model import ConnectorConnection, ConnectorOperation, SyncRun
 from app.modules.connectors.schemas import (
     ConnectionCreate,
@@ -613,13 +615,8 @@ async def test_get_connection_by_id_returns_404_when_not_found(
     assert exc_info.value.status_code == 404
 
 
-def test_mapping_requires_source_customer_id() -> None:
-    with pytest.raises(ValidationError, match="source_customer_id"):
-        MappingCreate(
-            schema_snapshot_id=uuid.uuid4(),
-            fields=[{"source_path": "email", "target_field": "email"}],
-        )
-    with pytest.raises(ValidationError, match="unsupported customer target_field"):
+def test_mapping_schema_rejects_unknown_and_duplicate_targets() -> None:
+    with pytest.raises(ValidationError, match="unsupported target_field: password"):
         MappingCreate(
             schema_snapshot_id=uuid.uuid4(),
             fields=[
@@ -627,6 +624,84 @@ def test_mapping_requires_source_customer_id() -> None:
                 {"source_path": "secret", "target_field": "password"},
             ],
         )
+    with pytest.raises(ValidationError, match="unique"):
+        MappingCreate(
+            schema_snapshot_id=uuid.uuid4(),
+            fields=[
+                {"source_path": "id", "target_field": "source_customer_id"},
+                {"source_path": "id2", "target_field": "source_customer_id"},
+            ],
+        )
+
+
+def test_field_needs_exactly_one_of_source_path_or_constant() -> None:
+    with pytest.raises(ValidationError, match="exactly one"):
+        MappingCreate(schema_snapshot_id=uuid.uuid4(), fields=[{"target_field": "currency"}])
+    with pytest.raises(ValidationError, match="exactly one"):
+        MappingCreate(
+            schema_snapshot_id=uuid.uuid4(),
+            fields=[{"source_path": "c", "constant": "THB", "target_field": "currency"}],
+        )
+
+
+def test_customer_mapping_requires_source_customer_id_and_no_constants() -> None:
+    assert mapping_errors("CUSTOMER", ["email"]) == [
+        "customer mapping requires target_field source_customer_id"
+    ]
+    assert mapping_errors("CUSTOMER", ["source_customer_id", "email"]) == []
+    assert "customer mappings do not support constant values" in mapping_errors(
+        "CUSTOMER", ["source_customer_id", "status"], constant_targets=["status"]
+    )
+    errors = mapping_errors("CUSTOMER", ["source_customer_id", "amount"])
+    assert any("unsupported customer" in e for e in errors)
+
+
+def test_transaction_and_event_contracts() -> None:
+    transaction = [
+        "source_transaction_id", "source_customer_id", "transaction_type", "occurred_at",
+        "amount", "currency",
+    ]
+    constants = ["currency", "transaction_type"]
+    assert mapping_errors("TRANSACTION", transaction, constant_targets=constants) == []
+    assert mapping_errors("TRANSACTION", ["source_transaction_id"]) == [
+        "transaction mapping requires target_field transaction_type",
+        "transaction mapping requires target_field occurred_at",
+        "transaction mapping requires target_field amount",
+        "transaction mapping requires target_field currency",
+    ]
+    assert "source_transaction_id must come from a source column, not a constant" in mapping_errors(
+        "TRANSACTION", transaction, constant_targets=["source_transaction_id"]
+    )
+    event = ["source_event_id", "event_name", "occurred_at"]
+    assert mapping_errors("EVENT", event) == [
+        "event mapping requires target_field source_customer_id or anonymous_id"
+    ]
+    assert mapping_errors("EVENT", [*event, "anonymous_id"]) == []
+    assert mapping_errors("LEAD", ["x"]) == ["unsupported target_entity: LEAD"]
+
+
+def test_constant_fields_skip_source_path_validation() -> None:
+    payload = MappingCreate(
+        schema_snapshot_id=uuid.uuid4(),
+        fields=[
+            {"source_path": "id", "target_field": "source_transaction_id"},
+            {"constant": "THB", "target_field": "currency"},
+        ],
+    )
+    _validate_mapping_source_paths({"columns": [{"name": "id", "type": "text"}]}, payload)
+
+
+def test_dataset_update_accepts_generic_entities_only() -> None:
+    assert DatasetUpdate(target_entity="TRANSACTION").target_entity == "TRANSACTION"
+    with pytest.raises(ValidationError):
+        DatasetUpdate(target_entity="LEAD")
+
+
+def test_generic_entity_migration_allows_three_types() -> None:
+    migration = Path(__file__).parents[1] / "alembic/versions/007_generic_dataset_entities.py"
+    text = migration.read_text()
+    assert "CHECK (target_entity IN ('CUSTOMER', 'TRANSACTION', 'EVENT'))" in text
+    assert 'down_revision = "006_azure_sql_connector"' in text
 
 
 def test_mapping_source_paths_are_pinned_to_schema_snapshot() -> None:

@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # Enable only after aws-flex-deploy migrations 024/025 and API SELECT grants.
     connector_publication_status_enabled: bool = False
     connector_worker_poll_seconds: int = Field(default=1, ge=1, le=300)
+    # TRANSACTION/EVENT datasets can be configured and mapped, but sync stays off until
+    # the connector worker writes those entities (generic intake v2).
+    connector_generic_entities_enabled: bool = False
 
     standardization_source_secret_id: str | None = None
     # Inventory excludes dataset-1 trackers_2026 independently of this flag.

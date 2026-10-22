@@ -12,7 +12,9 @@ from app.modules.connectors.entities import (
     TargetEntity,
 )
 
-ConnectorEngine = Literal["postgresql", "mysql", "mariadb", "mongodb", "azure_sql"]
+ConnectorEngine = Literal[
+    "postgresql", "mysql", "mariadb", "mongodb", "azure_sql", "file_upload"
+]
 
 
 class ViewModel(BaseModel):
@@ -126,10 +128,17 @@ class ConnectionCreate(BaseModel):
     source_code: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
     endpoint_label: str | None = Field(default=None, max_length=255)
     safe_config: dict[str, Any] = Field(default_factory=dict)
-    credentials: SourceCredentials
+    # file_upload connections have no source credentials (files arrive through the upload API).
+    credentials: SourceCredentials | None = None
 
     @model_validator(mode="after")
     def validate_azure_sql(self) -> ConnectionCreate:
+        if self.engine == "file_upload":
+            if self.credentials is not None:
+                raise ValueError("file_upload connections take no credentials")
+            return self
+        if self.credentials is None:
+            raise ValueError("credentials are required for database connectors")
         if self.engine == "azure_sql":
             credentials = self.credentials
             if credentials.tunnel or credentials.uri or credentials.hosts:
@@ -241,14 +250,25 @@ class FieldMapping(BaseModel):
 
 
 class MappingCreate(BaseModel):
-    """Entity-specific rules (required fields per dataset type) are checked against the
-    dataset's target_entity in the service, because the payload does not carry it."""
+    """v1: `fields` for a single-type dataset. v2: `derived_keys` + `projections` for a MULTI
+    dataset (one source row -> several types; rules in intake_mapping.validate_mapping).
+    Entity-specific rules are checked against the dataset's target_entity in the service,
+    because the payload does not carry it."""
 
     schema_snapshot_id: uuid.UUID
-    fields: list[FieldMapping] = Field(min_length=1)
+    version: Literal[1, 2] = 1
+    fields: list[FieldMapping] | None = Field(default=None, min_length=1)
+    derived_keys: dict[str, Any] = Field(default_factory=dict)
+    projections: list[dict[str, Any]] | None = Field(default=None, min_length=1, max_length=50)
 
     @model_validator(mode="after")
     def unique_known_targets(self) -> MappingCreate:
+        if self.version == 2:
+            if self.projections is None or self.fields is not None:
+                raise ValueError("mapping v2 needs projections and no top-level fields")
+            return self
+        if self.fields is None or self.projections is not None or self.derived_keys:
+            raise ValueError("mapping v1 needs fields only; use version 2 for projections")
         targets = {field.target_field for field in self.fields}
         if len(targets) != len(self.fields):
             raise ValueError("mapping target_field values must be unique")
@@ -256,6 +276,42 @@ class MappingCreate(BaseModel):
         if unsupported:
             raise ValueError("unsupported target_field: " + ", ".join(unsupported))
         return self
+
+
+class UploadDatasetCreate(BaseModel):
+    """Registers one upload stream (e.g. a sheet exported from a dealer DMS) on a file_upload
+    connection. `columns` are the file's header names; they become the schema snapshot that
+    mappings are checked against."""
+
+    object_name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
+    columns: list[str] = Field(min_length=1, max_length=2000)
+    target_entity: TargetEntity = "MULTI"
+
+
+class UploadDatasetView(BaseModel):
+    dataset_id: uuid.UUID
+    schema_snapshot_id: uuid.UUID
+    object_name: str
+    target_entity: str
+    columns: list[str]
+    upload_prefix: str
+
+
+class IntakeOutputView(BaseModel):
+    """One projected output of an uploaded dataset file (control.intake_batch_output)."""
+
+    batch_ref: str
+    object_key: str
+    target_entity: str
+    route: str
+    status: str
+    source_rows: int
+    output_rows: int
+    rejected_rows: int
+    skipped_rows: int
+    handoff_batch_ref: str | None
+    error: str | None
+    updated_at: datetime
 
 
 class MappingView(ViewModel):

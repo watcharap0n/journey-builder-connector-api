@@ -1,8 +1,12 @@
 """Generic dataset types accepted by upload and connector intake.
 
-CUSTOMER is the current customer_profile contract. TRANSACTION and EVENT are the
-generic fact contracts behind Customer 360 (design:
-buzz-cdp-workspace/ops/design/generic-intake-and-customer-360-2026-10-21.md).
+CUSTOMER is the current customer_profile contract. TRANSACTION and EVENT are the generic
+fact contracts behind Customer 360; ASSET and RELATIONSHIP carry people-to-things and
+people-to-people links (households, shared vehicles). A MULTI dataset uses a mapping v2
+whose projections emit several of these types from one source row.
+The field contracts live in the vendored `intake_mapping` package so the API, the upload
+landing and the connector worker validate the same way. Design:
+buzz-cdp-workspace/ops/design/intake-v2-pipeline-2026-10-21.md
 """
 
 from __future__ import annotations
@@ -10,116 +14,27 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-TargetEntity = Literal["CUSTOMER", "TRANSACTION", "EVENT"]
-TARGET_ENTITIES: tuple[str, ...] = ("CUSTOMER", "TRANSACTION", "EVENT")
+from app.modules.connectors.intake_mapping.contracts import (
+    ENTITY_FIELDS,
+    ENTITY_KEY,
+    ENTITY_REQUIRED,
+)
 
-CUSTOMER_TARGET_FIELDS = frozenset({
-    "source_customer_id",
-    "external_id",
-    "first_name",
-    "middle_name",
-    "last_name",
-    "full_name",
-    "nickname",
-    "gender",
-    "date_of_birth",
-    "birthday",
-    "age",
-    "email",
-    "phone",
-    "line_user_id",
-    "facebook_id",
-    "google_id",
-    "apple_id",
-    "member_code",
-    "customer_type",
-    "status",
-    "language",
-    "address_line_1",
-    "address_line_2",
-    "district",
-    "province",
-    "postal_code",
-    "country",
-    "source",
-    "source_system",
-    "external_ids",
-    "attributes",
-    "source_created_at",
-    "source_updated_at",
-})
+TargetEntity = Literal["CUSTOMER", "TRANSACTION", "EVENT", "ASSET", "RELATIONSHIP", "MULTI"]
+SINGLE_ENTITIES: tuple[str, ...] = tuple(ENTITY_FIELDS)
+TARGET_ENTITIES: tuple[str, ...] = (*SINGLE_ENTITIES, "MULTI")
 
-# One row = one transaction (purchase, refund, point earn/burn/expire, redeem, payment...).
-# `transaction_type` + `currency` keep money and points apart; consumers filter them first.
-TRANSACTION_TARGET_FIELDS = frozenset({
-    "source_transaction_id",
-    "source_customer_id",  # empty = anonymous
-    "transaction_type",
-    "status",
-    "occurred_at",
-    "amount",
-    "currency",
-    "discount_amount",
-    "quantity",
-    "channel",
-    "location_id",
-    "items",  # product/asset refs, not person ids
-    "attributes",
-    "source_updated_at",
-})
-
-# One row = one occurrence (check-in, session, view/click, survey, message outcome...).
-EVENT_TARGET_FIELDS = frozenset({
-    "source_event_id",
-    "source_customer_id",
-    "anonymous_id",
-    "event_name",
-    "event_category",
-    "occurred_at",
-    "channel",
-    "object_type",
-    "object_id",
-    "value",
-    "attributes",
-})
-
-ENTITY_FIELDS: dict[str, frozenset[str]] = {
-    "CUSTOMER": CUSTOMER_TARGET_FIELDS,
-    "TRANSACTION": TRANSACTION_TARGET_FIELDS,
-    "EVENT": EVENT_TARGET_FIELDS,
-}
-
-# Each inner tuple is "at least one of".
-ENTITY_REQUIRED: dict[str, tuple[tuple[str, ...], ...]] = {
-    "CUSTOMER": (("source_customer_id",),),
-    "TRANSACTION": (
-        ("source_transaction_id",),
-        ("transaction_type",),
-        ("occurred_at",),
-        ("amount",),
-        ("currency",),
-    ),
-    "EVENT": (
-        ("source_event_id",),
-        ("event_name",),
-        ("occurred_at",),
-        ("source_customer_id", "anonymous_id"),
-    ),
-}
-
-ENTITY_KEY_FIELD = {
-    "CUSTOMER": "source_customer_id",
-    "TRANSACTION": "source_transaction_id",
-    "EVENT": "source_event_id",
-}
-
+CUSTOMER_TARGET_FIELDS = ENTITY_FIELDS["CUSTOMER"]
+TRANSACTION_TARGET_FIELDS = ENTITY_FIELDS["TRANSACTION"]
+EVENT_TARGET_FIELDS = ENTITY_FIELDS["EVENT"]
+ENTITY_KEY_FIELD = ENTITY_KEY
 ALL_TARGET_FIELDS = frozenset().union(*ENTITY_FIELDS.values())
 
 
 def mapping_errors(
     entity: str, targets: Iterable[str], *, constant_targets: Iterable[str] = ()
 ) -> list[str]:
-    """Return human-readable problems for a mapping against one entity contract."""
+    """Problems of a single-type (v1) mapping against one entity contract."""
     if entity not in ENTITY_FIELDS:
         return [f"unsupported target_entity: {entity}"]
     targets = set(targets)

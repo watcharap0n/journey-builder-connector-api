@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     # TRANSACTION/EVENT datasets can be configured and mapped, but sync stays off until
     # the connector worker writes those entities (generic intake v2).
     connector_generic_entities_enabled: bool = False
+    # Enable only after aws-flex-deploy migration 058 (control.intake_batch_output) is applied.
+    connector_intake_status_enabled: bool = False
 
     standardization_source_secret_id: str | None = None
     # Inventory excludes dataset-1 trackers_2026 independently of this flag.

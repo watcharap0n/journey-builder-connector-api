@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.infrastructure.database.session import get_db_session
 from app.modules.connectors.model import SyncRun
-from app.modules.connectors.repository import ConnectorRepository
+from app.modules.connectors.repository import ConnectorRepository, list_intake_outputs
 from app.modules.connectors.schemas import (
     ConnectionCreate,
     ConnectionListView,
@@ -21,6 +21,7 @@ from app.modules.connectors.schemas import (
     DatasetPreviewRequest,
     DatasetUpdate,
     DatasetView,
+    IntakeOutputView,
     MappingCreate,
     MappingView,
     OperationAccepted,
@@ -29,6 +30,8 @@ from app.modules.connectors.schemas import (
     ScheduleView,
     SchemaSnapshotView,
     SyncRunView,
+    UploadDatasetCreate,
+    UploadDatasetView,
     WorkspaceAppUpdate,
     WorkspaceCreate,
     WorkspaceView,
@@ -40,6 +43,7 @@ from app.modules.connectors.service import (
     control_schedule,
     create_connection,
     create_mapping,
+    create_upload_dataset,
     create_workspace,
     get_workspace,
     materialize_sync_run,
@@ -338,6 +342,58 @@ async def post_dataset_preview(
             request_json={"limit": payload.limit},
         )
         return OperationAccepted(operation_id=operation.operation_id, status=operation.status)
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post(
+    "/workspaces/{workspace_id}/connectors/{connection_id}/upload-datasets",
+    response_model=UploadDatasetView,
+    status_code=status.HTTP_201_CREATED,
+)
+async def post_upload_dataset(
+    workspace_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    payload: UploadDatasetCreate,
+    session: SessionDep,
+) -> UploadDatasetView:
+    """Register an upload stream; files then go to `upload_prefix` via the multipart API."""
+    try:
+        dataset, snapshot, columns, source_code = await create_upload_dataset(
+            session, workspace_id, connection_id, payload
+        )
+        return UploadDatasetView(
+            dataset_id=dataset.dataset_id,
+            schema_snapshot_id=snapshot.schema_snapshot_id,
+            object_name=dataset.object_name,
+            target_entity=dataset.target_entity,
+            columns=columns,
+            upload_prefix=(
+                f"data_sources/{source_code}/<batch_ref>/datasets/{dataset.dataset_id}/"
+            ),
+        )
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.get(
+    "/workspaces/{workspace_id}/datasets/{dataset_id}/intake-outputs",
+    response_model=list[IntakeOutputView],
+)
+async def get_intake_outputs(
+    workspace_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    session: SessionDep,
+    settings: SettingsDep,
+    batch_ref: str | None = None,
+) -> list[IntakeOutputView]:
+    """Status of uploaded files per projected type (CUSTOMER is HANDED_OFF to the customer
+    route under `handoff_batch_ref`; facts are LOADED into ClickHouse cdp_intake)."""
+    if not settings.connector_intake_status_enabled:
+        raise HTTPException(status_code=503, detail="intake status is not enabled")
+    try:
+        rows = await list_intake_outputs(session, workspace_id, dataset_id, batch_ref)
+        return [IntakeOutputView.model_validate(row) for row in rows]
     except Exception as exc:
         raise _translate_error(exc) from exc
 

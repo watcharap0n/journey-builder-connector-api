@@ -4,10 +4,11 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import Any, cast
 
 from sqlalchemy import (
     DateTime,
+    Integer,
     SQLColumnExpression,
     String,
     Uuid,
@@ -32,6 +33,26 @@ from app.modules.connectors.model import (
     SchemaSnapshot,
     SyncRun,
     Workspace,
+)
+
+# Read-only contract owned by aws-flex-deploy migration 058 (intake v2 upload outputs).
+INTAKE_BATCH_OUTPUT = table(
+    "intake_batch_output",
+    column("dataset_id", Uuid),
+    column("workspace_id", Uuid),
+    column("batch_ref", String),
+    column("object_key", String),
+    column("target_entity", String),
+    column("route", String),
+    column("status", String),
+    column("source_rows", Integer),
+    column("output_rows", Integer),
+    column("rejected_rows", Integer),
+    column("skipped_rows", Integer),
+    column("handoff_batch_ref", String),
+    column("error", String),
+    column("updated_at", DateTime(timezone=True)),
+    schema="control",
 )
 
 # Read-only contract owned by aws-flex-deploy migration 025, deliberately not an ORM
@@ -371,3 +392,16 @@ class ConnectorRepository:
                 )
             )
         )
+
+
+async def list_intake_outputs(
+    session: AsyncSession, workspace_id: uuid.UUID, dataset_id: uuid.UUID, batch_ref: str | None
+) -> list[dict[str, Any]]:
+    query = select(INTAKE_BATCH_OUTPUT).where(
+        INTAKE_BATCH_OUTPUT.c.workspace_id == workspace_id,
+        INTAKE_BATCH_OUTPUT.c.dataset_id == dataset_id,
+    )
+    if batch_ref:
+        query = query.where(INTAKE_BATCH_OUTPUT.c.batch_ref == batch_ref)
+    query = query.order_by(INTAKE_BATCH_OUTPUT.c.updated_at.desc()).limit(200)
+    return [dict(row) for row in (await session.execute(query)).mappings().all()]

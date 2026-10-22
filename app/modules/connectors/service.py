@@ -17,6 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.modules.connectors.entities import mapping_errors
+from app.modules.connectors.intake_mapping import (
+    Transforms,
+    normalize_headers,
+    referenced_paths,
+    validate_mapping,
+)
 from app.modules.connectors.model import (
     ConnectorConnection,
     ConnectorDataset,
@@ -36,6 +42,7 @@ from app.modules.connectors.schemas import (
     DatasetUpdate,
     MappingCreate,
     ScheduleUpsert,
+    UploadDatasetCreate,
     WorkspaceAppUpdate,
     WorkspaceCreate,
 )
@@ -140,6 +147,36 @@ def _validate_mapping_source_paths(
             "mapping source_path values are not present in schema snapshot: "
             + ", ".join(invalid_paths)
         )
+
+
+FILE_UPLOAD_ENGINE = "file_upload"
+# Validation only checks transform names; the real tenant key is used at landing time.
+_VALIDATION_TRANSFORMS = Transforms(hmac_key=b"validation-only")
+
+
+def _mapping_v2_json(payload: MappingCreate) -> dict[str, Any]:
+    return {
+        "version": 2,
+        "target_entity": "MULTI",
+        "derived_keys": payload.derived_keys,
+        "projections": payload.projections,
+    }
+
+
+def _validate_mapping_v2(schema_json: dict[str, Any], mapping_json: dict[str, Any]) -> None:
+    errors = validate_mapping(mapping_json, _VALIDATION_TRANSFORMS)
+    available = {
+        str(column.get("name"))
+        for column in schema_json.get("columns", [])
+        if isinstance(column, dict) and column.get("name")
+    }
+    missing = sorted(referenced_paths(mapping_json) - available)
+    if missing:
+        errors.append(
+            "mapping source columns are not present in schema snapshot: " + ", ".join(missing)
+        )
+    if errors:
+        raise ConnectorConfigurationError("; ".join(errors))
 
 
 def _outbox(
@@ -284,9 +321,16 @@ async def create_connection(
         status="PROVISIONING",
     )
     session.add(connection)
+    if payload.engine == FILE_UPLOAD_ENGINE:
+        # Files arrive through the upload API; there is nothing to store or test.
+        connection.status = "READY"
+        await session.commit()
+        await session.refresh(connection)
+        return connection
     created_secret_arn: str | None = None
     try:
         await session.flush()
+        assert payload.credentials is not None  # enforced by ConnectionCreate
         secret_arn, created = await _put_secret(
             settings,
             workspace_id=workspace_id,
@@ -381,6 +425,8 @@ async def queue_operation(
         raise ConnectorNotFoundError("connector not found")
     if connection.status == "DISABLED":
         raise ConnectorConflictError("connector is disabled")
+    if connection.definition_key == FILE_UPLOAD_ENGINE:
+        raise ConnectorConflictError("file_upload connections are fed by uploads, not the worker")
     resolved_idempotency_key = idempotency_key or str(uuid.uuid4())
     existing = await session.scalar(
         select(ConnectorOperation).where(
@@ -458,6 +504,75 @@ async def update_dataset(
     return dataset
 
 
+async def create_upload_dataset(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    connection_id: uuid.UUID,
+    payload: UploadDatasetCreate,
+) -> tuple[ConnectorDataset, SchemaSnapshot, list[str], str]:
+    """Registers (or re-uses) an upload stream and records the file header as a schema snapshot.
+
+    Headers are normalised exactly like the landing Lambda does (whitespace collapsed,
+    repeated names suffixed ' #2'), so mapping source paths match what landing will see.
+    """
+    repository = ConnectorRepository(session)
+    connection = await repository.get_connection(workspace_id, connection_id)
+    if connection is None:
+        raise ConnectorNotFoundError("connector not found")
+    if connection.definition_key != FILE_UPLOAD_ENGINE:
+        raise ConnectorConflictError("upload datasets belong to a file_upload connection")
+    columns = normalize_headers(payload.columns)
+    if any(not name for name in columns):
+        raise ConnectorConfigurationError("upload columns must not be blank")
+    dataset = await session.scalar(
+        select(ConnectorDataset).where(
+            ConnectorDataset.workspace_id == workspace_id,
+            ConnectorDataset.connection_id == connection_id,
+            ConnectorDataset.object_name == payload.object_name,
+        )
+    )
+    if dataset is None:
+        dataset = ConnectorDataset(
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            object_name=payload.object_name,
+            target_entity=payload.target_entity,
+            sync_mode="FULL_SNAPSHOT",
+            primary_key_paths=[],
+            cursor_paths=[],
+            status="DISCOVERED",
+        )
+        session.add(dataset)
+        await session.flush()
+    elif dataset.target_entity != payload.target_entity:
+        raise ConnectorConflictError(
+            "upload dataset exists with another target_entity; PATCH it first"
+        )
+    schema_json = {
+        "source": "upload_header",
+        "columns": [{"name": name, "type": "text"} for name in columns],
+    }
+    schema_hash = _canonical_hash(schema_json)
+    snapshot = await session.scalar(
+        select(SchemaSnapshot).where(
+            SchemaSnapshot.dataset_id == dataset.dataset_id,
+            SchemaSnapshot.schema_hash == schema_hash,
+        )
+    )
+    if snapshot is None:
+        snapshot = SchemaSnapshot(
+            workspace_id=workspace_id,
+            dataset_id=dataset.dataset_id,
+            schema_hash=schema_hash,
+            schema_json=schema_json,
+        )
+        session.add(snapshot)
+    await session.commit()
+    await session.refresh(dataset)
+    await session.refresh(snapshot)
+    return dataset, snapshot, columns, connection.source_code
+
+
 async def create_mapping(
     session: AsyncSession,
     workspace_id: uuid.UUID,
@@ -477,6 +592,18 @@ async def create_mapping(
     )
     if snapshot is None:
         raise ConnectorConfigurationError("schema snapshot does not belong to dataset")
+    if payload.version == 2:
+        if dataset.target_entity != "MULTI":
+            raise ConnectorConfigurationError(
+                "mapping v2 (projections) needs a dataset with target_entity MULTI"
+            )
+        mapping_json = _mapping_v2_json(payload)
+        _validate_mapping_v2(snapshot.schema_json, mapping_json)
+        return await _store_mapping(session, repository, workspace_id, dataset_id, payload,
+                                    mapping_json)
+    if dataset.target_entity == "MULTI":
+        raise ConnectorConfigurationError("MULTI datasets need a mapping v2 with projections")
+    assert payload.fields is not None  # enforced by MappingCreate for version 1
     errors = mapping_errors(
         dataset.target_entity,
         (field.target_field for field in payload.fields),
@@ -491,6 +618,18 @@ async def create_mapping(
         "target_entity": dataset.target_entity,
         "fields": [field.model_dump(mode="json", exclude_none=True) for field in payload.fields],
     }
+    return await _store_mapping(session, repository, workspace_id, dataset_id, payload,
+                                mapping_json)
+
+
+async def _store_mapping(
+    session: AsyncSession,
+    repository: ConnectorRepository,
+    workspace_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    payload: MappingCreate,
+    mapping_json: dict[str, Any],
+) -> MappingVersion:
     mapping = MappingVersion(
         workspace_id=workspace_id,
         dataset_id=dataset_id,
@@ -520,6 +659,10 @@ async def publish_mapping(
     entity = mapping.mapping_json.get("target_entity", "CUSTOMER")
     if entity != dataset.target_entity:
         raise ConnectorConfigurationError("mapping was built for another target_entity")
+    if mapping.mapping_json.get("version") == 2:
+        snapshot = await session.get(SchemaSnapshot, mapping.schema_snapshot_id)
+        _validate_mapping_v2(snapshot.schema_json if snapshot else {}, mapping.mapping_json)
+        return await _activate_mapping(session, dataset, mapping)
     fields = mapping.mapping_json.get("fields", [])
     errors = mapping_errors(
         entity,
@@ -528,6 +671,12 @@ async def publish_mapping(
     )
     if errors:
         raise ConnectorConfigurationError("; ".join(errors))
+    return await _activate_mapping(session, dataset, mapping)
+
+
+async def _activate_mapping(
+    session: AsyncSession, dataset: ConnectorDataset, mapping: MappingVersion
+) -> MappingVersion:
     mapping.status = "PUBLISHED"
     mapping.published_at = _utcnow()
     dataset.active_mapping_version_id = mapping.mapping_version_id
@@ -656,6 +805,8 @@ async def materialize_sync_run(
     connection = await repository.get_connection(workspace_id, dataset.connection_id)
     if connection is None or connection.status != "READY":
         raise ConnectorConflictError("connector must be READY before sync")
+    if connection.definition_key == FILE_UPLOAD_ENGINE:
+        raise ConnectorConflictError("file_upload datasets are loaded by uploads, not sync runs")
 
     existing = await session.scalar(
         select(ConnectorOperation).where(

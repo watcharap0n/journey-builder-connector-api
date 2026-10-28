@@ -174,13 +174,20 @@ class ProjectionResult:
     records: dict[str, list[dict]] = field(default_factory=dict)
     rejects: list[dict] = field(default_factory=list)
     skipped: dict[str, int] = field(default_factory=dict)
+    # Optional values that could not be read: dropped (the record is kept), listed here.
+    warnings: list[dict] = field(default_factory=list)
 
     def merge(self, other: ProjectionResult) -> None:
         for entity, recs in other.records.items():
             self.records.setdefault(entity, []).extend(recs)
         self.rejects.extend(other.rejects)
+        self.warnings.extend(other.warnings)
         for name, count in other.skipped.items():
             self.skipped[name] = self.skipped.get(name, 0) + count
+
+
+REQUIRED_FIELDS = {entity: frozenset(f for group in groups for f in group) | {"source_customer_id"}
+                   for entity, groups in ENTITY_REQUIRED.items()}
 
 
 class Projector:
@@ -209,7 +216,7 @@ class Projector:
                     break
         return cache[key_name]
 
-    def _pack(self, row: dict, items: list) -> dict | None:
+    def _pack(self, row: dict, items: list, dropped: list[str] | None = None) -> dict | None:
         packed = {}
         for item in items:
             if isinstance(item, str):
@@ -218,13 +225,20 @@ class Projector:
                 name, value = item["as"], item["constant"]
             else:
                 name = item["as"]
-                value = self._source(row, item["path"], item.get("transforms", []))
+                try:
+                    value = self._source(row, item["path"], item.get("transforms", []))
+                except TransformError as exc:
+                    # One unreadable extra value drops that value only, not the pack or record.
+                    if dropped is None:
+                        raise
+                    dropped.append(f"{name}: {exc}")
+                    continue
             if value is not None:
                 plain = isinstance(value, (str, int, float, bool))
                 packed[name] = value if plain else str(value)
         return packed or None
 
-    def _value(self, row: dict, spec: dict, cache: dict) -> Any:
+    def _value(self, row: dict, spec: dict, cache: dict, dropped: list[str] | None = None) -> Any:
         if spec.get("constant") is not None:
             return spec["constant"]
         if spec.get("derived_key") is not None:
@@ -239,7 +253,7 @@ class Projector:
                     return value
             return None
         if spec.get("pack") is not None:
-            return self._pack(row, spec["pack"])
+            return self._pack(row, spec["pack"], dropped)
         if spec.get("template") is not None:
             parts = {}
             for name in _PLACEHOLDER.findall(spec["template"]):
@@ -273,11 +287,19 @@ class Projector:
                 continue
             record: dict[str, Any] = {}
             problems: list[str] = []
+            dropped: list[str] = []
+            required = REQUIRED_FIELDS[entity]
             for spec in proj["fields"]:
+                target = spec["target_field"]
                 try:
-                    value = self._value(row, spec, cache)
+                    value = self._value(row, spec, cache, dropped)
                 except TransformError as exc:
-                    problems.append(f"{spec['target_field']}: {exc}")
+                    # Required fields and identifiers reject the record; any other unreadable
+                    # value is dropped and reported, so one bad optional cell never loses a row.
+                    if target in required:
+                        problems.append(f"{target}: {exc}")
+                    else:
+                        dropped.append(f"{target}: {exc}")
                     value = None
                 if value is not None:
                     record[spec["target_field"]] = value
@@ -297,6 +319,9 @@ class Projector:
                                        "row_number": row_number,
                                        "reasons": problems + [f"missing {m}" for m in missing]})
                 continue
+            if dropped:
+                result.warnings.append({"projection": name, "target_entity": entity,
+                                        "row_number": row_number, "dropped": dropped})
             for json_field in JSON_FIELDS & record.keys():
                 if not isinstance(record[json_field], str):
                     record[json_field] = json.dumps(record[json_field], ensure_ascii=False,

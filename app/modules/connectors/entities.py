@@ -2,11 +2,15 @@
 
 CUSTOMER is the current customer_profile contract. TRANSACTION and EVENT are the generic
 fact contracts behind Customer 360; ASSET and RELATIONSHIP carry people-to-things and
-people-to-people links (households, shared vehicles). A MULTI dataset uses a mapping v2
-whose projections emit several of these types from one source row.
+people-to-people links (households, shared vehicles). Retail types (2026-11-13): bill lines
+(TRANSACTION_ITEM), PRODUCT, STORE, CAMPAIGN, CONSENT, point movements (POINT_LEDGER) and
+balances (POINT_BALANCE), coupon definitions (COUPON) and entitlements (COUPON_WALLET).
+Points are their own types now, not packed into TRANSACTION. A MULTI dataset uses a mapping v2
+whose projections emit several of these types from one source row; uploads and database
+connectors both land through the same projection (cdp_intake).
 The field contracts live in the vendored `intake_mapping` package so the API, the upload
 landing and the connector worker validate the same way. Design:
-buzz-cdp-workspace/ops/design/intake-v2-pipeline-2026-10-21.md
+buzz-cdp-workspace/ops/design/intake-v2-pipeline-2026-10-21.md and dataset-types-2026-11-13.md
 """
 
 from __future__ import annotations
@@ -20,7 +24,11 @@ from app.modules.connectors.intake_mapping.contracts import (
     ENTITY_REQUIRED,
 )
 
-TargetEntity = Literal["CUSTOMER", "TRANSACTION", "EVENT", "ASSET", "RELATIONSHIP", "MULTI"]
+TargetEntity = Literal[
+    "CUSTOMER", "TRANSACTION", "EVENT", "ASSET", "RELATIONSHIP", "TRANSACTION_ITEM", "PRODUCT",
+    "STORE", "CAMPAIGN", "CONSENT", "POINT_LEDGER", "POINT_BALANCE", "COUPON", "COUPON_WALLET",
+    "MULTI",
+]
 SINGLE_ENTITIES: tuple[str, ...] = tuple(ENTITY_FIELDS)
 TARGET_ENTITIES: tuple[str, ...] = (*SINGLE_ENTITIES, "MULTI")
 

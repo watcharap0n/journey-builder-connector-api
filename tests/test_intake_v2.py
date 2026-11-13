@@ -52,9 +52,32 @@ MAPPING_V2 = {
 
 def test_target_entities_include_graph_types_and_multi() -> None:
     assert TARGET_ENTITIES == ("CUSTOMER", "TRANSACTION", "EVENT", "ASSET", "RELATIONSHIP",
-                               "MULTI")
-    for entity in ("MULTI", "ASSET", "RELATIONSHIP"):
+                               "TRANSACTION_ITEM", "PRODUCT", "STORE", "CAMPAIGN", "CONSENT",
+                               "POINT_LEDGER", "POINT_BALANCE", "COUPON", "COUPON_WALLET", "MULTI")
+    for entity in ("MULTI", "ASSET", "RELATIONSHIP", "PRODUCT", "POINT_LEDGER", "COUPON_WALLET"):
         assert DatasetUpdate(target_entity=entity).target_entity == entity
+
+
+def test_migration_009_allows_every_contract_type() -> None:
+    text = (Path(__file__).parents[1] / "alembic/versions/009_retail_dataset_types.py").read_text()
+    for entity in TARGET_ENTITIES:
+        assert f"'{entity}'" in text
+    assert 'down_revision = "008_intake_v2_multi_and_file_upload"' in text
+
+
+def test_line_level_mapping_with_grouped_bills_is_accepted() -> None:
+    from app.modules.connectors.intake_mapping import validate_mapping
+
+    mapping = {"version": 2, "projections": [
+        {"name": "bill", "target_entity": "TRANSACTION", "group_by": "source_transaction_id",
+         "fields": [{"target_field": "source_transaction_id", "source_path": "bill"},
+                    {"target_field": "transaction_type", "constant": "purchase"},
+                    {"target_field": "occurred_at", "source_path": "at", "transforms": ["parse_timestamp"]},
+                    {"target_field": "currency", "constant": "THB"}]},
+        {"name": "line", "target_entity": "TRANSACTION_ITEM",
+         "fields": [{"target_field": "source_transaction_id", "source_path": "bill"},
+                    {"target_field": "sku", "source_path": "sku"}]}]}
+    assert validate_mapping(mapping) == []
 
 
 def test_file_upload_connections_take_no_credentials() -> None:

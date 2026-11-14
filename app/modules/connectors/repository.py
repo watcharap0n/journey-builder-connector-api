@@ -76,9 +76,18 @@ def _publication_status(execution_status: SQLColumnExpression[str]) -> ColumnEle
         PUBLICATION_STATUS.c.stitching_job_id.is_not(None),
         PUBLICATION_STATUS.c.overall_status.in_(
             [
-                "STITCHING_QUEUED", "WAITING_FOR_LOCK", "VALIDATING", "STITCHING",
-                "STITCHING_UNKNOWN", "FAILED", "TRANSFER_PENDING", "TRANSFERRING",
-                "TRANSFER_FAILED", "TRANSFER_BLOCKED", "COMPLETED", "COMPLETED_WITH_WARNINGS",
+                "STITCHING_QUEUED",
+                "WAITING_FOR_LOCK",
+                "VALIDATING",
+                "STITCHING",
+                "STITCHING_UNKNOWN",
+                "FAILED",
+                "TRANSFER_PENDING",
+                "TRANSFERRING",
+                "TRANSFER_FAILED",
+                "TRANSFER_BLOCKED",
+                "COMPLETED",
+                "COMPLETED_WITH_WARNINGS",
             ]
         ),
     )
@@ -198,7 +207,8 @@ class ConnectorRepository:
         }
 
         schedule_rows = await self.session.execute(
-            select(ConnectorDataset.connection_id, ConnectorSchedule.timing_json).join(
+            select(ConnectorDataset.connection_id, ConnectorSchedule.timing_json)
+            .join(
                 ConnectorSchedule,
                 and_(
                     ConnectorSchedule.dataset_id == ConnectorDataset.dataset_id,
@@ -234,9 +244,7 @@ class ConnectorRepository:
                     connection=connection,
                     successful_records=successful_records,
                     error_records=records_rejected,
-                    duplicate_records=max(
-                        records_read - records_loaded - records_rejected, 0
-                    ),
+                    duplicate_records=max(records_read - records_loaded - records_rejected, 0),
                     frequency=frequency,
                 )
             )
@@ -252,7 +260,7 @@ class ConnectorRepository:
                     ConnectorConnection.workspace_id == workspace_id,
                     ConnectorConnection.connection_id == connection_id,
                 )
-            )
+            ),
         )
 
     async def list_datasets(
@@ -278,7 +286,7 @@ class ConnectorRepository:
                     ConnectorDataset.workspace_id == workspace_id,
                     ConnectorDataset.dataset_id == dataset_id,
                 )
-            )
+            ),
         )
 
     async def list_schema_snapshots(
@@ -304,7 +312,7 @@ class ConnectorRepository:
                     MappingVersion.workspace_id == workspace_id,
                     MappingVersion.mapping_version_id == mapping_id,
                 )
-            )
+            ),
         )
 
     async def next_mapping_version(self, dataset_id: uuid.UUID) -> int:
@@ -326,7 +334,7 @@ class ConnectorRepository:
                     ConnectorSchedule.workspace_id == workspace_id,
                     ConnectorSchedule.dataset_id == dataset_id,
                 )
-            )
+            ),
         )
 
     async def get_operation(
@@ -339,12 +347,28 @@ class ConnectorRepository:
                     ConnectorOperation.workspace_id == workspace_id,
                     ConnectorOperation.operation_id == operation_id,
                 )
-            )
+            ),
         )
 
     async def get_operation_publication_projection(
         self, workspace_id: uuid.UUID, operation_id: uuid.UUID, *, execution_status: str
     ) -> PublicationProjection:
+        if execution_status == "SUCCEEDED":
+            handoff = (
+                await self.session.execute(
+                    select(ConnectorOperation.result_json, SyncRun.dataset_id)
+                    .join(SyncRun, SyncRun.operation_id == ConnectorOperation.operation_id)
+                    .where(
+                        ConnectorOperation.workspace_id == workspace_id,
+                        ConnectorOperation.operation_id == operation_id,
+                    )
+                )
+            ).one_or_none()
+            result_json = (handoff.result_json if handoff else None) or {}
+            if result_json.get("route") == "cdp_intake":
+                return await self._intake_projection(
+                    workspace_id, handoff.dataset_id, result_json.get("batch_ref")
+                )
         result = await self.session.execute(
             select(
                 _publication_status(literal(execution_status)).label("status"),
@@ -380,9 +404,41 @@ class ConnectorRepository:
             transfer_error_code=None,
         )
 
-    async def get_sync_run(
-        self, workspace_id: uuid.UUID, sync_run_id: uuid.UUID
-    ) -> SyncRun | None:
+    async def _intake_projection(
+        self, workspace_id: uuid.UUID, dataset_id: uuid.UUID, batch_ref: str | None
+    ) -> PublicationProjection:
+        """A MULTI sync hands its extract to the upload landing: the run is done when every type
+        the landing projected from that file is loaded (control.intake_batch_output), not when
+        the legacy customer transfer of the pre-created batch is (that batch stays empty)."""
+        if not batch_ref:  # nothing was extracted, nothing to load
+            return PublicationProjection(
+                status="COMPLETED", updated_at=None, transfer_error_code=None
+            )
+        outputs = await list_intake_outputs(self.session, workspace_id, dataset_id, batch_ref)
+        updated = max((o["updated_at"] for o in outputs if o["updated_at"]), default=None)
+        if not outputs:
+            return PublicationProjection(
+                status="TRANSFER_PENDING", updated_at=None, transfer_error_code=None
+            )
+        states = {o["status"] for o in outputs}
+        if "FAILED" in states:
+            return PublicationProjection(
+                status="TRANSFER_FAILED",
+                updated_at=updated,
+                transfer_error_code="INTAKE_OUTPUT_FAILED",
+            )
+        if states - {"LOADED", "HANDED_OFF"}:
+            return PublicationProjection(
+                status="TRANSFERRING", updated_at=updated, transfer_error_code=None
+            )
+        warned = any((o["rejected_rows"] or 0) > 0 for o in outputs)
+        return PublicationProjection(
+            status="COMPLETED_WITH_WARNINGS" if warned else "COMPLETED",
+            updated_at=updated,
+            transfer_error_code=None,
+        )
+
+    async def get_sync_run(self, workspace_id: uuid.UUID, sync_run_id: uuid.UUID) -> SyncRun | None:
         return cast(
             SyncRun | None,
             await self.session.scalar(
@@ -390,7 +446,7 @@ class ConnectorRepository:
                     SyncRun.workspace_id == workspace_id,
                     SyncRun.sync_run_id == sync_run_id,
                 )
-            )
+            ),
         )
 
 

@@ -87,15 +87,21 @@ def test_target_entities_include_graph_types_and_multi() -> None:
         "POINT_BALANCE",
         "COUPON",
         "COUPON_WALLET",
+        "STOCK_BALANCE",
         "MULTI",
     )
-    for entity in ("MULTI", "ASSET", "RELATIONSHIP", "PRODUCT", "POINT_LEDGER", "COUPON_WALLET"):
+    for entity in (
+        "MULTI", "ASSET", "RELATIONSHIP", "PRODUCT", "POINT_LEDGER", "COUPON_WALLET",
+        "STOCK_BALANCE",
+    ):
         assert DatasetUpdate(target_entity=entity).target_entity == entity
 
 
 def test_migration_009_allows_every_contract_type() -> None:
     text = (Path(__file__).parents[1] / "alembic/versions/009_retail_dataset_types.py").read_text()
     for entity in TARGET_ENTITIES:
+        if entity == "STOCK_BALANCE":
+            continue  # added by 010
         assert f"'{entity}'" in text
     assert 'down_revision = "008_intake_v2_multi_and_file_upload"' in text
 
@@ -338,3 +344,10 @@ async def test_handed_off_sync_status_follows_the_intake_outputs(
     assert got.status == expected
     empty = await repo._intake_projection(uuid.uuid4(), uuid.uuid4(), None)
     assert empty.status == "COMPLETED"
+
+
+def test_migration_010_allows_every_contract_type() -> None:
+    text = (Path(__file__).parents[1] / "alembic/versions/010_stock_dataset_type.py").read_text()
+    for entity in TARGET_ENTITIES:
+        assert f"'{entity}'" in text
+    assert 'down_revision = "009_retail_dataset_types"' in text

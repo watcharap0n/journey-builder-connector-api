@@ -5,6 +5,7 @@ fact contracts behind Customer 360; ASSET and RELATIONSHIP carry people-to-thing
 people-to-people links (households, shared vehicles). Retail types (2026-11-13): bill lines
 (TRANSACTION_ITEM), PRODUCT, STORE, CAMPAIGN, CONSENT, point movements (POINT_LEDGER) and
 balances (POINT_BALANCE), coupon definitions (COUPON) and entitlements (COUPON_WALLET).
+Stock on hand per product and location (STOCK_BALANCE, 2026-11-21) feeds the Demand generator.
 Points are their own types now, not packed into TRANSACTION. A MULTI dataset uses a mapping v2
 whose projections emit several of these types from one source row; uploads and database
 connectors both land through the same projection (cdp_intake).
@@ -27,7 +28,7 @@ from app.modules.connectors.intake_mapping.contracts import (
 TargetEntity = Literal[
     "CUSTOMER", "TRANSACTION", "EVENT", "ASSET", "RELATIONSHIP", "TRANSACTION_ITEM", "PRODUCT",
     "STORE", "CAMPAIGN", "CONSENT", "POINT_LEDGER", "POINT_BALANCE", "COUPON", "COUPON_WALLET",
-    "MULTI",
+    "STOCK_BALANCE", "MULTI",
 ]
 SINGLE_ENTITIES: tuple[str, ...] = tuple(ENTITY_FIELDS)
 TARGET_ENTITIES: tuple[str, ...] = (*SINGLE_ENTITIES, "MULTI")
